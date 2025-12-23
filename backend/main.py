@@ -5,11 +5,6 @@ FastAPI application for manufacturing blueprint dimension detection
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import router as main_router
-from api.auth_routes import router as auth_router
-from api.payment_routes import router as payment_router
-from api.usage_routes import router as usage_router
-from api.history_routes import router as history_router
 from config import CORS_ORIGINS, APP_NAME, APP_VERSION
 
 app = FastAPI(
@@ -23,13 +18,19 @@ app = FastAPI(
 # CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
+    allow_origins=["*"],  # Allow all origins for now
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Include API routes
+# Import and include routers
+from api.routes import router as main_router
+from api.auth_routes import router as auth_router
+from api.payment_routes import router as payment_router
+from api.usage_routes import router as usage_router
+from api.history_routes import router as history_router
+
 app.include_router(main_router)
 app.include_router(auth_router)
 app.include_router(payment_router)
@@ -50,6 +51,23 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
+
+
+@app.get("/api")
+async def api_root():
+    return {
+        "name": f"{APP_NAME} API",
+        "version": APP_VERSION,
+        "endpoints": [
+            "/api/process",
+            "/api/export",
+            "/api/auth/magic-link",
+            "/api/auth/verify",
+            "/api/payments/pricing",
+            "/api/usage/check",
+            "/api/history"
+        ]
+    }
 
 
 if __name__ == "__main__":
