@@ -1,0 +1,42 @@
+# AutoBalloon Backend Dependencies
+
+# Web Framework
+fastapi>=0.100.0
+uvicorn>=0.23.0
+python-multipart>=0.0.6
+
+# Data Validation
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# HTTP Client (for API calls)
+httpx>=0.24.0
+
+# PDF Processing
+PyMuPDF>=1.23.0
+
+# Image Processing
+Pillow>=10.0.0
+
+# Excel Export
+openpyxl>=3.1.0
+
+# Async Support
+anyio>=3.7.0
+
+# Database - Supabase
+supabase>=2.0.0
+
+# Authentication
+PyJWT>=2.8.0
+python-jose[cryptography]>=3.3.0
+
+# Email - Resend
+resend>=0.8.0
+
+# Environment Variables
+python-dotenv>=1.0.0
+
+# Security
+passlib>=1.7.4
+secrets>=1.0.0
