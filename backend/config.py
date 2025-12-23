@@ -4,35 +4,94 @@ Environment variables and application constants
 """
 import os
 from pathlib import Path
+from dotenv import load_dotenv
 
-# API Keys (from environment)
+# Load .env file
+load_dotenv()
+
+# ======================
+# API Keys - External Services
+# ======================
 GOOGLE_CLOUD_API_KEY = os.getenv("GOOGLE_CLOUD_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
+# ======================
+# Supabase Configuration
+# ======================
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+
+# ======================
+# Paystack Configuration
+# ======================
+PAYSTACK_PUBLIC_KEY = os.getenv("PAYSTACK_PUBLIC_KEY", "")
+PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY", "")
+PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET", "")
+PAYSTACK_PLAN_CODE = os.getenv("PAYSTACK_PLAN_CODE", "")
+
+# ======================
+# Resend (Email) Configuration
+# ======================
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+EMAIL_FROM = os.getenv("EMAIL_FROM", "AutoBalloon <noreply@autoballoon.space>")
+
+# ======================
+# Application Configuration
+# ======================
+APP_URL = os.getenv("APP_URL", "https://autoballoon.space")
+APP_NAME = "AutoBalloon"
+APP_VERSION = "1.0.0"
+
+# JWT Configuration
+JWT_SECRET = os.getenv("JWT_SECRET", "your-super-secret-jwt-key-change-in-production")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_HOURS = 24 * 7  # 7 days
+
+# Magic Link Configuration
+MAGIC_LINK_EXPIRATION_MINUTES = 15
+
+# ======================
+# Usage Limits
+# ======================
+FREE_TIER_LIMIT = 3  # Free drawings per month
+
+# ======================
+# Pricing
+# ======================
+PRICE_MONTHLY_USD = 99
+PRICE_MONTHLY_NGN = 99 * 1600
+GRANDFATHER_PRICE_USD = 99
+FUTURE_PRICE_USD = 199
+
+# ======================
 # File Processing
+# ======================
 MAX_FILE_SIZE_MB = 25
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif"}
 TARGET_DPI = 400
 
+# ======================
 # Image Processing
-NORMALIZED_COORD_SYSTEM = 1000  # Gemini uses 0-1000 normalized coordinates
+# ======================
+NORMALIZED_COORD_SYSTEM = 1000
 
-# Balloon Rendering
-BALLOON_RADIUS_RATIO = 0.012  # 1.2% of image width
-BALLOON_MIN_RADIUS = 16
-BALLOON_MAX_RADIUS = 32
-
+# ======================
 # Confidence Thresholds
+# ======================
 HIGH_CONFIDENCE_THRESHOLD = 0.85
 MEDIUM_CONFIDENCE_THRESHOLD = 0.70
 
+# ======================
 # Paths
-BASE_DIR = Path(__file__).parent.parent
+# ======================
+BASE_DIR = Path(__file__).parent
 TEMP_DIR = BASE_DIR / "temp"
-TEMP_DIR.mkdir(exist_ok=True)
 
+# ======================
 # Export
+# ======================
 AS9102_COLUMNS = [
     "Char No",
     "Reference Location", 
@@ -42,3 +101,24 @@ AS9102_COLUMNS = [
     "Tool Used",
     "Non-Conformance"
 ]
+
+# ======================
+# CORS Configuration
+# ======================
+CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "https://autoballoon.space",
+    "https://www.autoballoon.space",
+]
+
+# ======================
+# Helper Functions
+# ======================
+def is_production():
+    return os.getenv("ENVIRONMENT", "development") == "production"
+
+def get_frontend_url():
+    if is_production():
+        return "https://autoballoon.space"
+    return "http://localhost:3000"
