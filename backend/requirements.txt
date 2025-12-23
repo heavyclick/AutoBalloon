@@ -39,4 +39,3 @@ python-dotenv>=1.0.0
 
 # Security
 passlib>=1.7.4
-secrets>=1.0.0
