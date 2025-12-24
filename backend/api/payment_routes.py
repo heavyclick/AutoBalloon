@@ -1,207 +1,185 @@
 """
-Payment API Routes
-Paystack checkout and webhook handling
+Payment Routes - LemonSqueezy Integration
 """
-from fastapi import APIRouter, HTTPException, Request, Depends
-from pydantic import BaseModel, EmailStr
+from fastapi import APIRouter, Request, Header, HTTPException
+from pydantic import BaseModel
 from typing import Optional
+import httpx
+import hmac
+import hashlib
+import os
 
-from services.payment_service import payment_service
-from services.auth_service import auth_service, User
-from api.auth_routes import get_current_user, require_auth
-from config import PAYSTACK_PUBLIC_KEY, PRICE_MONTHLY_USD, GRANDFATHER_PRICE_USD, FUTURE_PRICE_USD
+router = APIRouter(prefix="/api/payments", tags=["payments"])
 
-
-router = APIRouter(prefix="/payments", tags=["Payments"])
-
-
-# ==================
-# Request/Response Models
-# ==================
-
-class CreateCheckoutRequest(BaseModel):
-    """Request to create checkout session"""
-    email: EmailStr
-    callback_url: Optional[str] = None
-
-
-class CheckoutResponse(BaseModel):
-    """Response with checkout URL"""
-    success: bool
-    authorization_url: Optional[str] = None
-    reference: Optional[str] = None
-    message: Optional[str] = None
-
-
-class SubscriptionStatusResponse(BaseModel):
-    """Subscription status response"""
-    is_pro: bool
-    subscription_status: Optional[str] = None
-    current_period_end: Optional[str] = None
-    price: int = PRICE_MONTHLY_USD
-    grandfathered: bool = True
+# LemonSqueezy Configuration
+LEMONSQUEEZY_API_KEY = os.getenv("LEMONSQUEEZY_API_KEY", "")
+LEMONSQUEEZY_STORE_ID = os.getenv("LEMONSQUEEZY_STORE_ID", "")
+LEMONSQUEEZY_VARIANT_ID = os.getenv("LEMONSQUEEZY_VARIANT_ID", "")  # Your $99/month variant
+LEMONSQUEEZY_WEBHOOK_SECRET = os.getenv("LEMONSQUEEZY_WEBHOOK_SECRET", "")
+APP_URL = os.getenv("APP_URL", "https://autoballoon.space")
 
 
 class PricingResponse(BaseModel):
-    """Pricing information"""
-    current_price: int
-    future_price: int
-    currency: str = "USD"
-    is_grandfathered: bool = True
-    paystack_public_key: str
+    monthly_price: int
+    currency: str
+    features: list[str]
 
 
-# ==================
-# Endpoints
-# ==================
+class CheckoutRequest(BaseModel):
+    email: str
+
+
+class CheckoutResponse(BaseModel):
+    checkout_url: str
+
 
 @router.get("/pricing", response_model=PricingResponse)
 async def get_pricing():
-    """
-    Get current pricing information.
-    Used by frontend to display pricing.
-    """
+    """Get current pricing information"""
     return PricingResponse(
-        current_price=GRANDFATHER_PRICE_USD,
-        future_price=FUTURE_PRICE_USD,
+        monthly_price=99,
         currency="USD",
-        is_grandfathered=True,
-        paystack_public_key=PAYSTACK_PUBLIC_KEY
+        features=[
+            "Unlimited blueprint processing",
+            "AS9102 Form 3 Excel exports",
+            "Permanent cloud storage",
+            "Priority processing",
+            "Email support"
+        ]
     )
 
 
 @router.post("/create-checkout", response_model=CheckoutResponse)
-async def create_checkout(request: CreateCheckoutRequest):
-    """
-    Create a Paystack checkout session.
-    Returns URL to redirect user to for payment.
-    """
-    result = await payment_service.create_checkout_url(
-        email=request.email,
-        callback_url=request.callback_url
-    )
+async def create_checkout(request: CheckoutRequest):
+    """Create a LemonSqueezy checkout session"""
     
-    if result:
-        return CheckoutResponse(
-            success=True,
-            authorization_url=result["authorization_url"],
-            reference=result["reference"]
-        )
-    else:
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to create checkout session. Please try again."
-        )
-
-
-@router.get("/verify/{reference}")
-async def verify_payment(reference: str):
-    """
-    Verify a payment by reference.
-    Called after user returns from Paystack.
-    """
-    result = await payment_service.verify_transaction(reference)
+    if not LEMONSQUEEZY_API_KEY or not LEMONSQUEEZY_STORE_ID:
+        raise HTTPException(status_code=500, detail="Payment not configured")
     
-    if result:
-        # Get or create user and update pro status
-        email = result.get("customer", {}).get("email")
-        if email:
-            user = auth_service.get_or_create_user(email)
-            auth_service.update_user_pro_status(
-                email, 
-                True,
-                result.get("customer", {}).get("customer_code")
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.lemonsqueezy.com/v1/checkouts",
+                headers={
+                    "Authorization": f"Bearer {LEMONSQUEEZY_API_KEY}",
+                    "Content-Type": "application/vnd.api+json",
+                    "Accept": "application/vnd.api+json"
+                },
+                json={
+                    "data": {
+                        "type": "checkouts",
+                        "attributes": {
+                            "checkout_data": {
+                                "email": request.email,
+                                "custom": {
+                                    "user_email": request.email
+                                }
+                            },
+                            "product_options": {
+                                "redirect_url": f"{APP_URL}/success",
+                            }
+                        },
+                        "relationships": {
+                            "store": {
+                                "data": {
+                                    "type": "stores",
+                                    "id": LEMONSQUEEZY_STORE_ID
+                                }
+                            },
+                            "variant": {
+                                "data": {
+                                    "type": "variants",
+                                    "id": LEMONSQUEEZY_VARIANT_ID
+                                }
+                            }
+                        }
+                    }
+                }
             )
             
-            # Generate access token for auto-login
-            if user:
-                # Refresh user to get updated pro status
-                user = auth_service.get_user_by_email(email)
-                access_token = auth_service.create_access_token(user)
+            if response.status_code == 201:
+                data = response.json()
+                checkout_url = data["data"]["attributes"]["url"]
+                return CheckoutResponse(checkout_url=checkout_url)
+            else:
+                print(f"LemonSqueezy error: {response.text}")
+                raise HTTPException(status_code=500, detail="Failed to create checkout")
                 
-                return {
-                    "success": True,
-                    "user": user.model_dump(),
-                    "access_token": access_token,
-                    "message": "Payment successful! Welcome to Pro."
-                }
-        
-        return {
-            "success": True,
-            "message": "Payment verified successfully"
-        }
-    else:
-        return {
-            "success": False,
-            "message": "Payment not found or not completed"
-        }
+    except Exception as e:
+        print(f"Checkout error: {e}")
+        raise HTTPException(status_code=500, detail="Payment service error")
 
 
 @router.post("/webhook")
-async def paystack_webhook(request: Request):
-    """
-    Handle Paystack webhook events.
-    Called by Paystack when payment events occur.
-    """
-    # Get raw body for signature verification
+async def handle_webhook(
+    request: Request,
+    x_signature: Optional[str] = Header(None, alias="X-Signature")
+):
+    """Handle LemonSqueezy webhook events"""
+    
     body = await request.body()
-    signature = request.headers.get("x-paystack-signature", "")
     
-    # Verify signature
-    if not payment_service.verify_webhook_signature(body, signature):
-        raise HTTPException(status_code=401, detail="Invalid signature")
+    # Verify webhook signature
+    if LEMONSQUEEZY_WEBHOOK_SECRET and x_signature:
+        expected_signature = hmac.new(
+            LEMONSQUEEZY_WEBHOOK_SECRET.encode(),
+            body,
+            hashlib.sha256
+        ).hexdigest()
+        
+        if not hmac.compare_digest(expected_signature, x_signature):
+            raise HTTPException(status_code=401, detail="Invalid signature")
     
-    # Parse event
+    payload = await request.json()
+    event_name = payload.get("meta", {}).get("event_name")
+    
+    if event_name == "subscription_created":
+        # New subscription
+        custom_data = payload.get("meta", {}).get("custom_data", {})
+        user_email = custom_data.get("user_email")
+        
+        if user_email:
+            # TODO: Update user to Pro in Supabase
+            print(f"New Pro subscription: {user_email}")
+            # In production:
+            # await supabase.table("users").update({"is_pro": True}).eq("email", user_email).execute()
+    
+    elif event_name == "subscription_cancelled":
+        custom_data = payload.get("meta", {}).get("custom_data", {})
+        user_email = custom_data.get("user_email")
+        
+        if user_email:
+            print(f"Subscription cancelled: {user_email}")
+            # In production:
+            # await supabase.table("users").update({"is_pro": False}).eq("email", user_email).execute()
+    
+    return {"status": "received"}
+
+
+@router.get("/verify/{order_id}")
+async def verify_payment(order_id: str):
+    """Verify a payment/subscription status"""
+    
     try:
-        event = await request.json()
-    except:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-    
-    # Handle the event
-    success = await payment_service.handle_webhook(event)
-    
-    if success:
-        return {"status": "success"}
-    else:
-        return {"status": "error"}
-
-
-@router.get("/subscription-status", response_model=SubscriptionStatusResponse)
-async def get_subscription_status(user: User = Depends(require_auth)):
-    """
-    Get current user's subscription status.
-    """
-    status = await payment_service.get_subscription_status(user.email)
-    
-    subscription = status.get("subscription", {}) if status else {}
-    
-    return SubscriptionStatusResponse(
-        is_pro=user.is_pro,
-        subscription_status=subscription.get("status"),
-        current_period_end=subscription.get("current_period_end"),
-        price=GRANDFATHER_PRICE_USD,
-        grandfathered=True
-    )
-
-
-@router.post("/cancel-subscription")
-async def cancel_subscription(user: User = Depends(require_auth)):
-    """
-    Cancel the user's subscription.
-    """
-    if not user.is_pro:
-        raise HTTPException(status_code=400, detail="No active subscription")
-    
-    # Get user's subscription code
-    status = await payment_service.get_subscription_status(user.email)
-    subscription_code = status.get("paystack_subscription_code") if status else None
-    
-    if not subscription_code:
-        raise HTTPException(status_code=400, detail="Subscription not found")
-    
-    success = await payment_service.cancel_subscription(subscription_code)
-    
-    if success:
-        return {"success": True, "message": "Subscription cancelled"}
-    else:
-        raise HTTPException(status_code=500, detail="Failed to cancel subscription")
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"https://api.lemonsqueezy.com/v1/orders/{order_id}",
+                headers={
+                    "Authorization": f"Bearer {LEMONSQUEEZY_API_KEY}",
+                    "Accept": "application/vnd.api+json"
+                }
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                status = data["data"]["attributes"]["status"]
+                return {
+                    "success": status == "paid",
+                    "status": status
+                }
+            else:
+                return {"success": False, "status": "not_found"}
+                
+    except Exception as e:
+        print(f"Verify error: {e}")
+        return {"success": False, "status": "error"}
