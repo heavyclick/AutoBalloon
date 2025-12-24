@@ -2,8 +2,8 @@
  * Application Configuration Constants
  */
 
-export const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api';
-export const APP_URL = import.meta.env.VITE_APP_URL || 'http://localhost:3000';
+export const API_BASE_URL = import.meta.env.VITE_API_URL || 'https://autoballoon-production.up.railway.app/api';
+export const APP_URL = import.meta.env.VITE_APP_URL || 'https://autoballoon.space';
 
 // Pricing
 export const PRICE_MONTHLY = 99;
