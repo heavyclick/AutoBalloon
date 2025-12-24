@@ -312,7 +312,7 @@ function BlueprintViewer({ result, onReset, token }) {
         
         // Draw small dot at dimension
         ctx.beginPath();
-        ctx.arc(centerX, centerY, 4, 0, Math.PI * 2);
+        ctx.arc(centerX, centerY, 2, 0, Math.PI * 2);
         ctx.fillStyle = '#E63946';
         ctx.fill();
         
@@ -389,6 +389,7 @@ function BlueprintViewer({ result, onReset, token }) {
     <div className="space-y-6">
       {/* Header with stats */}
       <div className="flex flex-wrap items-center justify-between gap-4">
+        {/* Left side - Stats and Add Balloon */}
         <div className="flex items-center gap-4">
           <button
             onClick={onReset}
@@ -430,10 +431,10 @@ function BlueprintViewer({ result, onReset, token }) {
               </div>
             </>
           )}
-        </div>
-
-        {/* Action buttons */}
-        <div className="flex items-center gap-3 flex-wrap">
+          
+          <div className="h-6 w-px bg-[#2a2a2a]" />
+          
+          {/* Add Balloon - stays on left */}
           {isAddingBalloon ? (
             <div className="flex items-center gap-2">
               <input
@@ -454,7 +455,7 @@ function BlueprintViewer({ result, onReset, token }) {
           ) : (
             <button
               onClick={() => setIsAddingBalloon(true)}
-              className="px-4 py-2 bg-[#1a1a1a] hover:bg-[#252525] text-gray-300 rounded-lg transition-colors text-sm flex items-center gap-2"
+              className="px-3 py-1.5 bg-[#1a1a1a] hover:bg-[#252525] text-gray-300 rounded-lg transition-colors text-sm flex items-center gap-2"
             >
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
@@ -462,7 +463,10 @@ function BlueprintViewer({ result, onReset, token }) {
               Add Balloon
             </button>
           )}
-          
+        </div>
+
+        {/* Right side - Export buttons */}
+        <div className="flex items-center gap-3">
           <button
             onClick={handleDownloadImage}
             disabled={isDownloading}
@@ -478,6 +482,7 @@ function BlueprintViewer({ result, onReset, token }) {
           >
             Export CSV
           </button>
+          
           <button
             onClick={() => handleExport('xlsx')}
             disabled={isExporting}
@@ -538,7 +543,7 @@ function BlueprintViewer({ result, onReset, token }) {
                   stroke="#E63946"
                   strokeWidth="2"
                 />
-                <circle cx={`${centerX}%`} cy={`${centerY}%`} r="4" fill="#E63946" />
+                <circle cx={`${centerX}%`} cy={`${centerY}%`} r="2" fill="#E63946" />
               </g>
             );
           })}
