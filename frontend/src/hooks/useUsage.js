@@ -1,5 +1,4 @@
 import { useState, useEffect, useCallback } from 'react';
-import { useAuth } from '../context/AuthContext';
 import { API_BASE_URL, FREE_TIER_LIMIT } from '../constants/config';
 
 const VISITOR_ID_KEY = 'autoballoon_visitor_id';
@@ -18,7 +17,6 @@ function getVisitorId() {
 }
 
 export function useUsage() {
-  const { user, token, isPro } = useAuth();
   const [usage, setUsage] = useState({
     count: 0,
     limit: FREE_TIER_LIMIT,
@@ -27,34 +25,22 @@ export function useUsage() {
     isPro: false,
   });
   const [isLoading, setIsLoading] = useState(true);
-
   const visitorId = getVisitorId();
 
   const fetchUsage = useCallback(async () => {
     try {
-      const params = new URLSearchParams();
-      if (!user) {
-        params.append('visitor_id', visitorId);
-      }
-
-      const headers = {};
-      if (token) {
-        headers['Authorization'] = `Bearer ${token}`;
-      }
-
       const response = await fetch(
-        `${API_BASE_URL}/usage/check?${params.toString()}`,
-        { headers }
+        `${API_BASE_URL}/usage/check?visitor_id=${visitorId}`
       );
 
       if (response.ok) {
         const data = await response.json();
         setUsage({
-          count: data.count,
-          limit: data.limit,
-          remaining: data.remaining,
-          canProcess: data.can_process,
-          isPro: data.is_pro || isPro,
+          count: data.count || 0,
+          limit: data.limit || FREE_TIER_LIMIT,
+          remaining: data.remaining || FREE_TIER_LIMIT,
+          canProcess: data.can_process !== false,
+          isPro: data.is_pro || false,
         });
       }
     } catch (err) {
@@ -62,63 +48,41 @@ export function useUsage() {
     } finally {
       setIsLoading(false);
     }
-  }, [user, token, visitorId, isPro]);
+  }, [visitorId]);
 
   useEffect(() => {
     fetchUsage();
   }, [fetchUsage]);
 
   const incrementUsage = useCallback(async () => {
-    if (isPro) return;
-
     try {
-      const params = new URLSearchParams();
-      if (!user) {
-        params.append('visitor_id', visitorId);
-      }
-
-      const headers = { 'Content-Type': 'application/json' };
-      if (token) {
-        headers['Authorization'] = `Bearer ${token}`;
-      }
-
       const response = await fetch(
-        `${API_BASE_URL}/usage/increment?${params.toString()}`,
-        { method: 'POST', headers }
+        `${API_BASE_URL}/usage/increment?visitor_id=${visitorId}`,
+        { method: 'POST' }
       );
 
       if (response.ok) {
         const data = await response.json();
         setUsage({
-          count: data.count,
-          limit: data.limit,
-          remaining: data.remaining,
-          canProcess: data.can_process,
-          isPro: data.is_pro || isPro,
+          count: data.count || 0,
+          limit: data.limit || FREE_TIER_LIMIT,
+          remaining: data.remaining || 0,
+          canProcess: data.can_process !== false,
+          isPro: data.is_pro || false,
         });
       }
     } catch (err) {
       console.error('Failed to increment usage:', err);
     }
-  }, [user, token, visitorId, isPro]);
-
-  const canProcess = useCallback(() => {
-    if (isPro) return true;
-    return usage.remaining > 0;
-  }, [isPro, usage.remaining]);
-
-  const shouldShowPaywall = useCallback(() => {
-    if (isPro) return false;
-    return usage.count >= FREE_TIER_LIMIT;
-  }, [isPro, usage.count]);
+  }, [visitorId]);
 
   return {
     usage,
     isLoading,
     visitorId,
     incrementUsage,
-    canProcess,
-    shouldShowPaywall,
     refreshUsage: fetchUsage,
+    canProcess: () => usage.remaining > 0,
+    shouldShowPaywall: () => usage.remaining <= 0,
   };
 }
