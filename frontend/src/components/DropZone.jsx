@@ -27,8 +27,25 @@ export function DropZone({ onBeforeProcess }) {
     return null;
   };
 
-  const processFile = async (file) => {
-    if (!isPro && usage.remaining <= 0) { setShowPaywall(true); return; }
+const processFile = async (file) => {
+  // Fetch fresh usage data
+  let currentUsage = usage;
+  try {
+    const response = await fetch(`${API_BASE_URL}/usage/check?visitor_id=${visitorId}`);
+    if (response.ok) {
+      currentUsage = await response.json();
+    }
+  } catch (e) {}
+  
+  // Check with fresh data
+  if (!isPro && currentUsage.remaining <= 0) { 
+    setShowPaywall(true); 
+    return; 
+  }
+  
+  // ... rest of function
+}
+
     const validationError = validateFile(file);
     if (validationError) { setError(validationError); return; }
     if (onBeforeProcess && !onBeforeProcess()) return;
