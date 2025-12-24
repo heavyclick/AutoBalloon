@@ -1,8 +1,3 @@
-/**
- * DropZone Component
- * The main file upload and processing interface
- */
-
 import React, { useState, useCallback, useRef } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { useUsage } from '../hooks/useUsage';
@@ -49,7 +44,6 @@ export function DropZone({ onBeforeProcess }) {
   };
 
   const processFile = async (file) => {
-    // Check usage limit first
     if (!isPro && usage.remaining <= 0) {
       setShowPaywall(true);
       return;
@@ -92,12 +86,7 @@ export function DropZone({ onBeforeProcess }) {
       if (data.success) {
         setResult(data);
         await incrementUsage();
-        await refreshUsage();
-        
-        // Check if this was the last free use
-        if (!isPro && usage.remaining <= 1) {
-          // Will show paywall on next attempt
-        }
+        if (refreshUsage) await refreshUsage();
       } else {
         if (data.error?.code === 'USAGE_LIMIT_EXCEEDED') {
           setShowPaywall(true);
@@ -138,37 +127,17 @@ export function DropZone({ onBeforeProcess }) {
     setError(null);
   };
 
-  // Show paywall modal
   if (showPaywall) {
-    return (
-      <PaywallModal 
-        onClose={() => setShowPaywall(false)}
-        usage={usage}
-      />
-    );
+    return <PaywallModal onClose={() => setShowPaywall(false)} usage={usage} />;
   }
 
   if (result) {
-    return (
-      <BlueprintViewer 
-        result={result} 
-        onReset={handleReset}
-        token={token}
-      />
-    );
+    return <BlueprintViewer result={result} onReset={handleReset} token={token} />;
   }
 
   return (
     <div
-      className={`
-        relative border-2 border-dashed rounded-xl p-12
-        transition-all duration-200 cursor-pointer
-        ${isDragging 
-          ? 'border-[#E63946] bg-[#E63946]/10' 
-          : 'border-[#2a2a2a] hover:border-[#3a3a3a] hover:bg-[#1a1a1a]'
-        }
-        ${isProcessing ? 'pointer-events-none' : ''}
-      `}
+      className={`relative border-2 border-dashed rounded-xl p-12 transition-all duration-200 cursor-pointer ${isDragging ? 'border-[#E63946] bg-[#E63946]/10' : 'border-[#2a2a2a] hover:border-[#3a3a3a] hover:bg-[#1a1a1a]'} ${isProcessing ? 'pointer-events-none' : ''}`}
       onDragEnter={handleDragEnter}
       onDragLeave={handleDragLeave}
       onDragOver={handleDragOver}
@@ -191,28 +160,14 @@ export function DropZone({ onBeforeProcess }) {
         </div>
       ) : (
         <div className="text-center">
-          <div className={`
-            w-20 h-20 rounded-full mx-auto mb-6 flex items-center justify-center
-            ${isDragging ? 'bg-[#E63946]/20' : 'bg-[#1a1a1a]'}
-          `}>
-            <svg 
-              className={`w-10 h-10 ${isDragging ? 'text-[#E63946]' : 'text-gray-400'}`} 
-              fill="none" 
-              stroke="currentColor" 
-              viewBox="0 0 24 24"
-            >
+          <div className={`w-20 h-20 rounded-full mx-auto mb-6 flex items-center justify-center ${isDragging ? 'bg-[#E63946]/20' : 'bg-[#1a1a1a]'}`}>
+            <svg className={`w-10 h-10 ${isDragging ? 'text-[#E63946]' : 'text-gray-400'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
             </svg>
           </div>
-          <p className="text-xl font-medium text-white mb-2">
-            {isDragging ? 'Drop your file here' : 'Drag & drop your blueprint'}
-          </p>
-          <p className="text-gray-400 mb-4">
-            or <span className="text-[#E63946]">click to browse</span>
-          </p>
-          <p className="text-gray-500 text-sm">
-            PDF, PNG, JPEG, TIFF • Max {MAX_FILE_SIZE_MB}MB
-          </p>
+          <p className="text-xl font-medium text-white mb-2">{isDragging ? 'Drop your file here' : 'Drag & drop your blueprint'}</p>
+          <p className="text-gray-400 mb-4">or <span className="text-[#E63946]">click to browse</span></p>
+          <p className="text-gray-500 text-sm">PDF, PNG, JPEG, TIFF - Max {MAX_FILE_SIZE_MB}MB</p>
         </div>
       )}
 
@@ -225,17 +180,11 @@ export function DropZone({ onBeforeProcess }) {
   );
 }
 
-/**
- * Paywall Modal
- */
 function PaywallModal({ onClose, usage }) {
   return (
     <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
       <div className="bg-[#161616] rounded-2xl max-w-md w-full p-8 relative">
-        <button
-          onClick={onClose}
-          className="absolute top-4 right-4 text-gray-500 hover:text-white"
-        >
+        <button onClick={onClose} className="absolute top-4 right-4 text-gray-500 hover:text-white">
           <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
           </svg>
@@ -248,9 +197,7 @@ function PaywallModal({ onClose, usage }) {
             </svg>
           </div>
           <h2 className="text-2xl font-bold text-white mb-2">Free Limit Reached</h2>
-          <p className="text-gray-400">
-            You've used all {usage?.limit || 3} free drawings this month.
-          </p>
+          <p className="text-gray-400">You have used all {usage?.limit || 3} free drawings this month.</p>
         </div>
         
         <div className="bg-[#1a1a1a] rounded-xl p-6 mb-6">
@@ -263,50 +210,42 @@ function PaywallModal({ onClose, usage }) {
           </div>
           <ul className="space-y-3 text-sm">
             <li className="flex items-center gap-2 text-gray-300">
-              <svg className="w-5 h-5 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <svg className="w-5 h-5 text-green-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
               </svg>
               Unlimited blueprint processing
             </li>
             <li className="flex items-center gap-2 text-gray-300">
-              <svg className="w-5 h-5 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <svg className="w-5 h-5 text-green-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
               </svg>
               AS9102 Form 3 Excel exports
             </li>
             <li className="flex items-center gap-2 text-gray-300">
-              <svg className="w-5 h-5 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <svg className="w-5 h-5 text-green-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
               </svg>
-              Permanent cloud storage
+              CMM results import
             </li>
             <li className="flex items-center gap-2 text-gray-300">
-              <svg className="w-5 h-5 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <svg className="w-5 h-5 text-green-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
               </svg>
-              Priority support
+              Revision comparison (Delta FAI)
             </li>
           </ul>
         </div>
         
-        
-          href="/pricing"
-          className="block w-full py-3 bg-[#E63946] hover:bg-[#c62d39] text-white font-semibold rounded-lg text-center transition-colors"
-        >
+        <a href="/pricing" className="block w-full py-3 bg-[#E63946] hover:bg-[#c62d39] text-white font-semibold rounded-lg text-center transition-colors">
           Upgrade to Pro
         </a>
         
-        <p className="text-center text-gray-500 text-sm mt-4">
-          Free limit resets on the 1st of each month
-        </p>
+        <p className="text-center text-gray-500 text-sm mt-4">Free limit resets on the 1st of each month</p>
       </div>
     </div>
   );
 }
 
-/**
- * BlueprintViewer Component
- */
 function BlueprintViewer({ result, onReset, token }) {
   const [isExporting, setIsExporting] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
@@ -328,11 +267,7 @@ function BlueprintViewer({ result, onReset, token }) {
         body: JSON.stringify({
           format,
           template: 'AS9102_FORM3',
-          dimensions: dimensions.map(d => ({
-            id: d.id,
-            value: d.value,
-            zone: d.zone,
-          })),
+          dimensions: dimensions.map(d => ({ id: d.id, value: d.value, zone: d.zone })),
           filename: result.metadata?.filename || 'inspection',
         }),
       });
@@ -362,31 +297,25 @@ function BlueprintViewer({ result, onReset, token }) {
       const ctx = canvas.getContext('2d');
       const img = imageRef.current;
       
-      if (!img) {
-        setIsDownloading(false);
-        return;
-      }
+      if (!img) { setIsDownloading(false); return; }
       
       canvas.width = img.naturalWidth;
       canvas.height = img.naturalHeight;
       ctx.drawImage(img, 0, 0);
       
-      // Scale balloon size based on image resolution
       const scale = Math.max(canvas.width, canvas.height) / 1000;
-      const balloonRadius = Math.max(20, 16 * scale);
-      const fontSize = Math.max(14, 12 * scale);
-      const lineWidth = Math.max(2, 1.5 * scale);
-      const offsetX = 40 * scale;
-      const offsetY = 35 * scale;
+      const balloonRadius = Math.max(24, 20 * scale);
+      const fontSize = Math.max(16, 14 * scale);
+      const lineWidth = Math.max(3, 2 * scale);
+      const offsetX = 50 * scale;
+      const offsetY = 45 * scale;
       
       dimensions.forEach(dim => {
         const centerX = ((dim.bounding_box.xmin + dim.bounding_box.xmax) / 2 / 1000) * canvas.width;
         const centerY = ((dim.bounding_box.ymin + dim.bounding_box.ymax) / 2 / 1000) * canvas.height;
-        
         const balloonX = centerX + offsetX;
         const balloonY = centerY - offsetY;
         
-        // Leader line
         ctx.beginPath();
         ctx.moveTo(centerX, centerY);
         ctx.lineTo(balloonX, balloonY);
@@ -394,13 +323,11 @@ function BlueprintViewer({ result, onReset, token }) {
         ctx.lineWidth = lineWidth;
         ctx.stroke();
         
-        // Small dot at dimension (smaller)
         ctx.beginPath();
-        ctx.arc(centerX, centerY, Math.max(2, 1.5 * scale), 0, Math.PI * 2);
+        ctx.arc(centerX, centerY, Math.max(3, 2 * scale), 0, Math.PI * 2);
         ctx.fillStyle = '#E63946';
         ctx.fill();
         
-        // Balloon circle
         ctx.beginPath();
         ctx.arc(balloonX, balloonY, balloonRadius, 0, Math.PI * 2);
         ctx.fillStyle = 'white';
@@ -409,7 +336,6 @@ function BlueprintViewer({ result, onReset, token }) {
         ctx.lineWidth = lineWidth;
         ctx.stroke();
         
-        // Balloon number
         ctx.fillStyle = '#E63946';
         ctx.font = `bold ${fontSize}px Arial`;
         ctx.textAlign = 'center';
@@ -428,7 +354,6 @@ function BlueprintViewer({ result, onReset, token }) {
         a.remove();
         setIsDownloading(false);
       }, 'image/png');
-      
     } catch (err) {
       console.error('Download failed:', err);
       setIsDownloading(false);
@@ -467,13 +392,9 @@ function BlueprintViewer({ result, onReset, token }) {
 
   return (
     <div className="space-y-6">
-      {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center gap-4 flex-wrap">
-          <button
-            onClick={onReset}
-            className="text-gray-400 hover:text-white transition-colors flex items-center gap-2"
-          >
+          <button onClick={onReset} className="text-gray-400 hover:text-white transition-colors flex items-center gap-2">
             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
             </svg>
@@ -481,29 +402,19 @@ function BlueprintViewer({ result, onReset, token }) {
           </button>
           
           <div className="h-6 w-px bg-[#2a2a2a]" />
-          
-          <span className="text-sm">
-            <span className="text-gray-400">Detected: </span>
-            <span className="text-white font-medium">{dimensions.length} dimensions</span>
-          </span>
+          <span className="text-sm"><span className="text-gray-400">Detected: </span><span className="text-white font-medium">{dimensions.length} dimensions</span></span>
           
           {result.grid?.detected && (
             <>
               <div className="h-6 w-px bg-[#2a2a2a]" />
-              <span className="text-sm">
-                <span className="text-gray-400">Grid: </span>
-                <span className="text-white font-medium">{result.grid.columns?.length}×{result.grid.rows?.length}</span>
-              </span>
+              <span className="text-sm"><span className="text-gray-400">Grid: </span><span className="text-white font-medium">{result.grid.columns?.length}x{result.grid.rows?.length}</span></span>
             </>
           )}
           
           {result.metadata?.processing_time_ms && (
             <>
               <div className="h-6 w-px bg-[#2a2a2a]" />
-              <span className="text-sm">
-                <span className="text-gray-400">Time: </span>
-                <span className="text-white font-medium">{(result.metadata.processing_time_ms / 1000).toFixed(1)}s</span>
-              </span>
+              <span className="text-sm"><span className="text-gray-400">Time: </span><span className="text-white font-medium">{(result.metadata.processing_time_ms / 1000).toFixed(1)}s</span></span>
             </>
           )}
           
@@ -519,15 +430,10 @@ function BlueprintViewer({ result, onReset, token }) {
                 className="px-3 py-1.5 bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg text-white text-sm w-24"
                 autoFocus
               />
-              <button onClick={() => setIsAddingBalloon(false)} className="text-gray-400 hover:text-white text-sm">
-                Cancel
-              </button>
+              <button onClick={() => setIsAddingBalloon(false)} className="text-gray-400 hover:text-white text-sm">Cancel</button>
             </div>
           ) : (
-            <button
-              onClick={() => setIsAddingBalloon(true)}
-              className="px-3 py-1.5 bg-[#1a1a1a] hover:bg-[#252525] text-gray-300 rounded-lg transition-colors text-sm flex items-center gap-2"
-            >
+            <button onClick={() => setIsAddingBalloon(true)} className="px-3 py-1.5 bg-[#1a1a1a] hover:bg-[#252525] text-gray-300 rounded-lg transition-colors text-sm flex items-center gap-2">
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
               </svg>
@@ -537,25 +443,13 @@ function BlueprintViewer({ result, onReset, token }) {
         </div>
 
         <div className="flex items-center gap-3">
-          <button
-            onClick={handleDownloadImage}
-            disabled={isDownloading}
-            className="px-4 py-2 bg-[#1a1a1a] hover:bg-[#252525] text-gray-300 rounded-lg transition-colors text-sm disabled:opacity-50"
-          >
+          <button onClick={handleDownloadImage} disabled={isDownloading} className="px-4 py-2 bg-[#1a1a1a] hover:bg-[#252525] text-gray-300 rounded-lg transition-colors text-sm disabled:opacity-50">
             {isDownloading ? 'Saving...' : 'Download Image'}
           </button>
-          <button
-            onClick={() => handleExport('csv')}
-            disabled={isExporting}
-            className="px-4 py-2 bg-[#1a1a1a] hover:bg-[#252525] text-gray-300 rounded-lg transition-colors text-sm disabled:opacity-50"
-          >
+          <button onClick={() => handleExport('csv')} disabled={isExporting} className="px-4 py-2 bg-[#1a1a1a] hover:bg-[#252525] text-gray-300 rounded-lg transition-colors text-sm disabled:opacity-50">
             Export CSV
           </button>
-          <button
-            onClick={() => handleExport('xlsx')}
-            disabled={isExporting}
-            className="px-4 py-2 bg-[#E63946] hover:bg-[#c62d39] text-white font-medium rounded-lg transition-colors text-sm disabled:opacity-50 flex items-center gap-2"
-          >
+          <button onClick={() => handleExport('xlsx')} disabled={isExporting} className="px-4 py-2 bg-[#E63946] hover:bg-[#c62d39] text-white font-medium rounded-lg transition-colors text-sm disabled:opacity-50 flex items-center gap-2">
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
             </svg>
@@ -564,7 +458,6 @@ function BlueprintViewer({ result, onReset, token }) {
         </div>
       </div>
 
-      {/* Blueprint */}
       <div 
         ref={containerRef}
         className={`relative bg-[#0a0a0a] rounded-xl overflow-hidden ${isAddingBalloon ? 'cursor-crosshair' : ''}`}
@@ -579,8 +472,8 @@ function BlueprintViewer({ result, onReset, token }) {
           {dimensions.map((dim) => {
             const centerX = (dim.bounding_box.xmin + dim.bounding_box.xmax) / 2 / 10;
             const centerY = (dim.bounding_box.ymin + dim.bounding_box.ymax) / 2 / 10;
-            const balloonX = centerX + 3.5;
-            const balloonY = Math.max(3, centerY - 3);
+            const balloonX = centerX + 4;
+            const balloonY = Math.max(4, centerY - 4);
             return (
               <g key={`leader-${dim.id}`}>
                 <line x1={`${centerX}%`} y1={`${centerY}%`} x2={`${balloonX}%`} y2={`${balloonY}%`} stroke="#E63946" strokeWidth="2" />
@@ -593,9 +486,7 @@ function BlueprintViewer({ result, onReset, token }) {
         {dimensions.map((dim) => {
           const centerX = (dim.bounding_box.xmin + dim.bounding_box.xmax) / 2 / 10;
           const centerY = (dim.bounding_box.ymin + dim.bounding_box.ymax) / 2 / 10;
-          return (
-            <Balloon key={dim.id} dimension={dim} left={centerX + 3.5} top={Math.max(3, centerY - 3)} onDelete={() => handleDeleteDimension(dim.id)} />
-          );
+          return <Balloon key={dim.id} dimension={dim} left={centerX + 4} top={Math.max(4, centerY - 4)} onDelete={() => handleDeleteDimension(dim.id)} />;
         })}
         
         {isAddingBalloon && (
@@ -605,7 +496,6 @@ function BlueprintViewer({ result, onReset, token }) {
         )}
       </div>
 
-      {/* Table */}
       <div className="bg-[#0a0a0a] rounded-xl overflow-hidden">
         <div className="px-4 py-3 bg-[#1a1a1a] border-b border-[#2a2a2a]">
           <h3 className="font-medium text-white">Detected Dimensions</h3>
@@ -624,7 +514,7 @@ function BlueprintViewer({ result, onReset, token }) {
               {dimensions.map((dim) => (
                 <tr key={dim.id} className="border-b border-[#1a1a1a] hover:bg-[#161616]">
                   <td className="px-4 py-2 text-white">{dim.id}</td>
-                  <td className="px-4 py-2 text-gray-300">{dim.zone || '—'}</td>
+                  <td className="px-4 py-2 text-gray-300">{dim.zone || '-'}</td>
                   <td className="px-4 py-2 text-white font-mono">{dim.value}</td>
                   <td className="px-4 py-2 text-right">
                     <button onClick={() => handleDeleteDimension(dim.id)} className="text-gray-500 hover:text-red-500">
@@ -637,9 +527,7 @@ function BlueprintViewer({ result, onReset, token }) {
               ))}
             </tbody>
           </table>
-          {dimensions.length === 0 && (
-            <div className="px-4 py-8 text-center text-gray-500">No dimensions detected.</div>
-          )}
+          {dimensions.length === 0 && <div className="px-4 py-8 text-center text-gray-500">No dimensions detected.</div>}
         </div>
       </div>
     </div>
