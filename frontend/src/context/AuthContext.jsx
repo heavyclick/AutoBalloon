@@ -2,7 +2,6 @@
  * AuthContext
  * Manages authentication state, user info, and Pro status
  */
-
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { API_BASE_URL } from '../constants/config';
 
@@ -26,7 +25,6 @@ export function AuthProvider({ children }) {
         setToken(savedToken);
         setUser(JSON.parse(savedUser));
       } catch (e) {
-        // Invalid data, clear it
         localStorage.removeItem(TOKEN_KEY);
         localStorage.removeItem(USER_KEY);
       }
@@ -54,7 +52,6 @@ export function AuthProvider({ children }) {
         setUser(userData);
         localStorage.setItem(USER_KEY, JSON.stringify(userData));
       } else {
-        // Token invalid, clear auth
         logout();
       }
     } catch (err) {
