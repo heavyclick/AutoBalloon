@@ -1,210 +1,194 @@
 """
-Download Routes - Multi-Page Ballooned Output
-API endpoints for generating downloadable files with balloons.
+API Routes - Fixed Version
+Handles file upload, processing, and export generation.
+Compatible with both single-page and multi-page PDFs.
 """
 from typing import Optional, List
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, UploadFile, HTTPException, Form
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import io
+import os
+
+from models.schemas import (
+    ExportFormat, 
+    ExportTemplate, 
+    ExportRequest,
+    ExportMetadata,
+)
 
 
-router = APIRouter(prefix="/download", tags=["Downloads"])
+router = APIRouter()  # NO PREFIX - endpoints registered at root, main.py handles routing
 
 
 # ==================
-# Request Models
+# Helper function to create detection service
 # ==================
 
-class PageData(BaseModel):
-    """Page data for download generation"""
-    page_number: int
-    image: str  # base64 encoded PNG
-    width: int = 1700
-    height: int = 2200
-    dimensions: List[dict] = []
-    grid_detected: bool = True
-
-
-class DownloadRequest(BaseModel):
-    """Request for download generation"""
-    pages: List[PageData]
-    part_number: Optional[str] = None
-    part_name: Optional[str] = None
-    revision: Optional[str] = None
-    grid_detected: bool = True
-
-
-class SingleImageDownloadRequest(BaseModel):
-    """Request for single image download"""
-    image: str  # base64 encoded
-    width: int
-    height: int
-    dimensions: List[dict]
-    format: str = "png"  # png or jpeg
+def get_detection_service():
+    """Create detection service with API keys from environment"""
+    from services.detection_service import create_detection_service
+    return create_detection_service(
+        ocr_api_key=os.getenv("GOOGLE_CLOUD_API_KEY"),
+        gemini_api_key=os.getenv("GEMINI_API_KEY")
+    )
 
 
 # ==================
 # API Endpoints
 # ==================
 
-@router.post("/pdf")
-async def download_ballooned_pdf(request: DownloadRequest):
+@router.post("/process")
+async def process_drawing(file: UploadFile = File(...)):
     """
-    Generate a single PDF with all pages ballooned.
+    Process uploaded engineering drawing (PDF or image).
+    
+    Supports:
+    - Multi-page PDF (up to 20 pages)
+    - Single images (PNG, JPEG)
+    
+    Returns:
+    - All pages with base64 images
+    - Dimensions with sequential balloon numbers across all pages
+    - Grid detection status per page
     """
-    from services.download_service import download_service
+    # Create detection service inside function (not as parameter)
+    detection_service = get_detection_service()
+    
+    # Read file bytes
+    file_bytes = await file.read()
+    
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Empty file uploaded")
+    
+    # Process file (handles both PDF and images)
+    result = await detection_service.detect_dimensions_multipage(
+        file_bytes=file_bytes,
+        filename=file.filename
+    )
+    
+    if not result.success:
+        raise HTTPException(
+            status_code=422, 
+            detail=result.error_message or "Failed to process file"
+        )
+    
+    # Build response - compatible with both old and new frontend
+    response_data = {
+        "success": True,
+        "total_pages": result.total_pages,
+        "message": result.error_message,  # e.g., "Processed 20 of 25 pages"
+    }
+    
+    # Multi-page response format
+    if result.total_pages > 1:
+        pages = []
+        for page_result in result.pages:
+            pages.append({
+                "page_number": page_result.page_number,
+                "image": page_result.image_base64,
+                "width": page_result.width,
+                "height": page_result.height,
+                "dimensions": [
+                    {
+                        "id": dim.id,
+                        "value": dim.value,
+                        "zone": dim.zone,
+                        "page": dim.page,
+                        "bounding_box": {
+                            "xmin": dim.bounding_box.xmin,
+                            "ymin": dim.bounding_box.ymin,
+                            "xmax": dim.bounding_box.xmax,
+                            "ymax": dim.bounding_box.ymax,
+                        },
+                        "confidence": dim.confidence
+                    }
+                    for dim in page_result.dimensions
+                ],
+                "grid_detected": page_result.grid_detected
+            })
+        response_data["pages"] = pages
+        
+        # Also include flattened dimensions for backward compatibility
+        response_data["dimensions"] = [
+            {
+                "id": dim.id,
+                "value": dim.value,
+                "zone": dim.zone,
+                "page": dim.page,
+                "bounding_box": {
+                    "xmin": dim.bounding_box.xmin,
+                    "ymin": dim.bounding_box.ymin,
+                    "xmax": dim.bounding_box.xmax,
+                    "ymax": dim.bounding_box.ymax,
+                },
+                "confidence": dim.confidence
+            }
+            for dim in result.all_dimensions
+        ]
+    else:
+        # Single page - backward compatible format
+        if result.pages:
+            page = result.pages[0]
+            response_data["image"] = page.image_base64
+            response_data["dimensions"] = [
+                {
+                    "id": dim.id,
+                    "value": dim.value,
+                    "zone": dim.zone,
+                    "bounding_box": {
+                        "xmin": dim.bounding_box.xmin,
+                        "ymin": dim.bounding_box.ymin,
+                        "xmax": dim.bounding_box.xmax,
+                        "ymax": dim.bounding_box.ymax,
+                    },
+                    "confidence": dim.confidence
+                }
+                for dim in page.dimensions
+            ]
+            response_data["grid"] = {
+                "detected": page.grid_detected,
+                "columns": ["H", "G", "F", "E", "D", "C", "B", "A"],
+                "rows": ["4", "3", "2", "1"]
+            }
+            response_data["metadata"] = {
+                "filename": file.filename,
+                "width": page.width,
+                "height": page.height
+            }
+    
+    return response_data
+
+
+@router.post("/export")
+async def export_inspection_data(request: ExportRequest):
+    """
+    Export dimension data to CSV or AS9102 Excel.
+    
+    Supports:
+    - CSV format (simple)
+    - Excel with AS9102 Form 3 template
+    - Multi-page drawings with Sheet column
+    """
     from models.schemas import ExportMetadata
     
     # Build metadata
     metadata = None
-    if request.part_number or request.part_name or request.revision:
-        metadata = ExportMetadata(
-            part_number=request.part_number,
-            part_name=request.part_name,
-            revision=request.revision
-        )
+    if request.metadata:
+        metadata = request.metadata
     
-    # Convert pages to dict format
-    pages_data = [
-        {
-            "page_number": p.page_number,
-            "image": p.image,
-            "width": p.width,
-            "height": p.height,
-            "dimensions": p.dimensions
-        }
-        for p in request.pages
-    ]
-    
-    # Generate PDF
-    result = download_service.generate_ballooned_pdf(
-        pages=pages_data,
-        metadata=metadata
-    )
-    
-    if not result.success:
-        raise HTTPException(status_code=500, detail=result.error_message)
-    
-    return StreamingResponse(
-        io.BytesIO(result.file_bytes),
-        media_type=result.content_type,
-        headers={
-            "Content-Disposition": f'attachment; filename="{result.filename}"'
-        }
-    )
-
-
-@router.post("/zip")
-async def download_zip_bundle(request: DownloadRequest):
-    """
-    Generate a ZIP bundle with ballooned images and AS9102 Excel.
-    """
-    from services.download_service import download_service
-    from models.schemas import ExportMetadata
-    
-    # Build metadata
-    metadata = None
-    if request.part_number or request.part_name or request.revision:
-        metadata = ExportMetadata(
-            part_number=request.part_number,
-            part_name=request.part_name,
-            revision=request.revision
-        )
-    
-    # Convert pages to dict format
-    pages_data = [
-        {
-            "page_number": p.page_number,
-            "image": p.image,
-            "width": p.width,
-            "height": p.height,
-            "dimensions": p.dimensions
-        }
-        for p in request.pages
-    ]
-    
-    # Generate ZIP
-    result = download_service.generate_zip_bundle(
-        pages=pages_data,
-        metadata=metadata,
-        grid_detected=request.grid_detected
-    )
-    
-    if not result.success:
-        raise HTTPException(status_code=500, detail=result.error_message)
-    
-    return StreamingResponse(
-        io.BytesIO(result.file_bytes),
-        media_type=result.content_type,
-        headers={
-            "Content-Disposition": f'attachment; filename="{result.filename}"'
-        }
-    )
-
-
-@router.post("/image")
-async def download_single_image(request: SingleImageDownloadRequest):
-    """
-    Generate a single ballooned image.
-    """
-    from services.download_service import download_service
-    
-    result = download_service.generate_single_ballooned_image(
-        image_base64=request.image,
-        dimensions=request.dimensions,
-        width=request.width,
-        height=request.height,
-        format=request.format
-    )
-    
-    if not result.success:
-        raise HTTPException(status_code=500, detail=result.error_message)
-    
-    return StreamingResponse(
-        io.BytesIO(result.file_bytes),
-        media_type=result.content_type,
-        headers={
-            "Content-Disposition": f'attachment; filename="{result.filename}"'
-        }
-    )
-
-
-@router.post("/excel")
-async def download_excel_only(request: DownloadRequest):
-    """
-    Generate AS9102 Form 3 Excel file only (no images).
-    """
-    from services.export_service import export_service
-    from models.schemas import ExportFormat, ExportTemplate, ExportMetadata
-    
-    # Build metadata
-    metadata = None
-    if request.part_number or request.part_name or request.revision:
-        metadata = ExportMetadata(
-            part_number=request.part_number,
-            part_name=request.part_name,
-            revision=request.revision
-        )
-    
-    # Collect all dimensions
-    all_dimensions = []
-    for page in request.pages:
-        for dim in page.dimensions:
-            dim_copy = dict(dim)
-            dim_copy["page"] = page.page_number
-            all_dimensions.append(dim_copy)
-    
-    # Generate Excel
+    # Generate export
     file_bytes, content_type, filename = export_service.generate_export(
-        dimensions=all_dimensions,
-        format=ExportFormat.XLSX,
-        template=ExportTemplate.AS9102_FORM3,
+        dimensions=request.dimensions,
+        format=request.format,
+        template=request.template,
         metadata=metadata,
-        grid_detected=request.grid_detected,
-        total_pages=len(request.pages)
+        filename=request.filename or "inspection",
+        grid_detected=getattr(request, 'grid_detected', True),
+        total_pages=getattr(request, 'total_pages', 1)
     )
     
+    # Return as downloadable file
     return StreamingResponse(
         io.BytesIO(file_bytes),
         media_type=content_type,
@@ -212,3 +196,9 @@ async def download_excel_only(request: DownloadRequest):
             "Content-Disposition": f'attachment; filename="{filename}"'
         }
     )
+
+
+@router.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "ok", "service": "autoballoon-api"}
