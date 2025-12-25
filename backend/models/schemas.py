@@ -1,8 +1,9 @@
 """
 Pydantic models for AutoBalloon API
+Updated to support multi-page PDF processing
 """
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime
 from enum import Enum
 
@@ -30,6 +31,7 @@ class Dimension(BaseModel):
     zone: Optional[str] = None
     bounding_box: BoundingBox
     confidence: float = Field(..., ge=0.0, le=1.0)
+    page: int = 1  # NEW: Page number for multi-page documents
     manually_added: bool = False
     manually_moved: bool = False
 
@@ -51,13 +53,30 @@ class ProcessingMetadata(BaseModel):
     processing_time_ms: int
 
 
+# ==================
+# UPDATED: Multi-page response models
+# ==================
+
+class PageResult(BaseModel):
+    """Result for a single page in multi-page processing"""
+    page_number: int
+    image: str  # Base64 encoded PNG
+    width: int
+    height: int
+    dimensions: List[Dimension] = []
+    grid_detected: bool = True
+
+
 class ProcessResponse(BaseModel):
-    """Response from /api/process endpoint"""
+    """Response from /api/process endpoint - Updated for multi-page"""
     success: bool
-    image: Optional[str] = None  # Base64 encoded image
-    dimensions: list[Dimension] = []
+    total_pages: int = 1  # NEW: Total pages in document
+    pages: List[PageResult] = []  # NEW: Per-page results
+    image: Optional[str] = None  # Base64 encoded image (legacy single-page)
+    dimensions: list[Dimension] = []  # All dimensions (legacy, or flattened)
     grid: Optional[GridInfo] = None
     metadata: Optional[ProcessingMetadata] = None
+    message: Optional[str] = None  # NEW: Warning messages (e.g., "Processed 20 of 25 pages")
     error: Optional[dict] = None
 
 
@@ -96,12 +115,14 @@ class ExportMetadata(BaseModel):
 
 
 class ExportRequest(BaseModel):
-    """Request body for /api/export endpoint"""
+    """Request body for /api/export endpoint - Updated for multi-page"""
     format: ExportFormat
     template: ExportTemplate = ExportTemplate.AS9102_FORM3
     dimensions: list[dict]
     metadata: Optional[ExportMetadata] = None
     filename: str = "inspection"
+    total_pages: int = 1  # NEW: For Sheet column in export
+    grid_detected: bool = True  # NEW: For footer note
 
 
 class UpdateBalloonRequest(BaseModel):
@@ -120,6 +141,7 @@ class AddBalloonRequest(BaseModel):
     """Request to manually add a balloon"""
     value: str
     bounding_box: BoundingBox
+    page: int = 1  # NEW: Which page to add balloon to
 
 
 class AddBalloonResponse(BaseModel):
