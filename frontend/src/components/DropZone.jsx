@@ -2,6 +2,8 @@ import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { useUsage } from '../hooks/useUsage';
 import { API_BASE_URL, MAX_FILE_SIZE_MB, ALLOWED_EXTENSIONS } from '../constants/config';
+import { GlassWallPaywall } from './GlassWallPaywall';
+import { PreviewWatermark } from './PreviewWatermark';
 
 export function DropZone({ onBeforeProcess }) {
   const { token, isPro } = useAuth();
@@ -12,28 +14,16 @@ export function DropZone({ onBeforeProcess }) {
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState(null);
   const [result, setResult] = useState(null);
-  const [showPaywall, setShowPaywall] = useState(false);
+  const [showGlassWall, setShowGlassWall] = useState(false);
   const [showRevisionCompare, setShowRevisionCompare] = useState(false);
   
-  // NEW: Multi-page state
+  // Multi-page state
   const [currentPage, setCurrentPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
 
   useEffect(() => { if (refreshUsage) refreshUsage(); }, []);
 
-  const checkUsageLimit = async () => {
-    try {
-      const response = await fetch(`${API_BASE_URL}/usage/check?visitor_id=${visitorId}`);
-      if (response.ok) {
-        const data = await response.json();
-        if (!data.is_pro && data.remaining <= 0) {
-          setShowPaywall(true);
-          return false;
-        }
-      }
-    } catch (e) {}
-    return true;
-  };
+  // REMOVED: checkUsageLimit - Glass Wall doesn't block uploads
 
   const handleDragEnter = useCallback((e) => { e.preventDefault(); e.stopPropagation(); setIsDragging(true); }, []);
   const handleDragLeave = useCallback((e) => { e.preventDefault(); e.stopPropagation(); setIsDragging(false); }, []);
@@ -47,9 +37,8 @@ export function DropZone({ onBeforeProcess }) {
     return null;
   };
 
+  // MODIFIED: No usage check - everyone can upload and process
   const processFile = async (file) => {
-    const canProceed = await checkUsageLimit();
-    if (!canProceed) return;
     const validationError = validateFile(file);
     if (validationError) { setError(validationError); return; }
     if (onBeforeProcess && !onBeforeProcess()) return;
@@ -68,17 +57,17 @@ export function DropZone({ onBeforeProcess }) {
       const response = await fetch(`${API_BASE_URL}/process`, { method: 'POST', headers, body: formData });
       const data = await response.json();
       if (data.success) {
-        // Handle multi-page response
         if (data.pages && data.pages.length > 0) {
           setTotalPages(data.total_pages || data.pages.length);
           setCurrentPage(1);
         }
         setResult(data);
+        // Still track usage for analytics
         await incrementUsage();
         if (refreshUsage) await refreshUsage();
       } else {
-        if (data.error?.code === 'USAGE_LIMIT_EXCEEDED') setShowPaywall(true);
-        else setError(data.error?.message || 'Processing failed');
+        // REMOVED: Usage limit paywall trigger
+        setError(data.error?.message || 'Processing failed');
       }
     } catch (err) {
       setError('Network error. Please check your connection.');
@@ -104,14 +93,43 @@ export function DropZone({ onBeforeProcess }) {
     setShowRevisionCompare(false);
   };
 
-  const handleOpenCompare = async () => {
-    const canProceed = await checkUsageLimit();
-    if (canProceed) setShowRevisionCompare(true);
+  // MODIFIED: No usage check for revision compare
+  const handleOpenCompare = () => {
+    setShowRevisionCompare(true);
   };
 
-  if (showPaywall) return <PaywallModal onClose={() => setShowPaywall(false)} usage={usage} />;
-  if (showRevisionCompare) return <RevisionCompare onClose={() => setShowRevisionCompare(false)} onComplete={handleRevisionCompareResult} visitorId={visitorId} incrementUsage={incrementUsage} checkUsageLimit={checkUsageLimit} />;
-  if (result) return <BlueprintViewer result={result} onReset={handleReset} token={token} currentPage={currentPage} setCurrentPage={setCurrentPage} totalPages={totalPages} />;
+  // Calculate dimensions for Glass Wall
+  const getTotalDimensionCount = () => {
+    if (!result) return 0;
+    if (result.pages && result.pages.length > 0) {
+      return result.pages.reduce((sum, p) => sum + (p.dimensions?.length || 0), 0);
+    }
+    return result.dimensions?.length || 0;
+  };
+
+  if (showRevisionCompare) return <RevisionCompare onClose={() => setShowRevisionCompare(false)} onComplete={handleRevisionCompareResult} visitorId={visitorId} incrementUsage={incrementUsage} isPro={isPro} onShowGlassWall={() => setShowGlassWall(true)} />;
+  
+  if (result) return (
+    <>
+      {/* Glass Wall Paywall - shows when non-pro tries to download */}
+      <GlassWallPaywall 
+        isOpen={showGlassWall}
+        onClose={() => setShowGlassWall(false)}
+        dimensionCount={getTotalDimensionCount()}
+        estimatedHours={(getTotalDimensionCount() * 1 + 10) / 60}
+      />
+      <BlueprintViewer 
+        result={result} 
+        onReset={handleReset} 
+        token={token}
+        isPro={isPro}
+        onShowGlassWall={() => setShowGlassWall(true)}
+        currentPage={currentPage} 
+        setCurrentPage={setCurrentPage} 
+        totalPages={totalPages} 
+      />
+    </>
+  );
 
   return (
     <div className="space-y-4">
@@ -150,117 +168,8 @@ export function DropZone({ onBeforeProcess }) {
   );
 }
 
-// ============ PAYWALL MODAL ============
-function PaywallModal({ onClose, usage }) {
-  const [email, setEmail] = useState('');
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [submitted, setSubmitted] = useState(false);
-  const [countdown, setCountdown] = useState({ hours: 24, minutes: 0, seconds: 0 });
-  const isPaymentConfigured = false;
-
-  useEffect(() => {
-    if (!isPaymentConfigured) {
-      const timer = setInterval(() => {
-        setCountdown(prev => {
-          let { hours, minutes, seconds } = prev;
-          if (seconds > 0) seconds--;
-          else if (minutes > 0) { minutes--; seconds = 59; }
-          else if (hours > 0) { hours--; minutes = 59; seconds = 59; }
-          return { hours, minutes, seconds };
-        });
-      }, 1000);
-      return () => clearInterval(timer);
-    }
-  }, [isPaymentConfigured]);
-
-  const handleEmailSubmit = async (e) => {
-    e.preventDefault();
-    if (!email) return;
-    setIsSubmitting(true);
-    try {
-      await fetch(`${API_BASE_URL}/waitlist`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email }) });
-      setSubmitted(true);
-    } catch (err) { console.error('Failed to join waitlist:', err); }
-    setIsSubmitting(false);
-  };
-
-  if (isPaymentConfigured) {
-    return (
-      <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
-        <div className="bg-[#161616] rounded-2xl max-w-md w-full p-8 relative">
-          <button onClick={onClose} className="absolute top-4 right-4 text-gray-500 hover:text-white">
-            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-          </button>
-          <div className="text-center mb-6">
-            <div className="w-16 h-16 bg-[#E63946]/20 rounded-full flex items-center justify-center mx-auto mb-4">
-              <svg className="w-8 h-8 text-[#E63946]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
-            </div>
-            <h2 className="text-2xl font-bold text-white mb-2">Free Limit Reached</h2>
-            <p className="text-gray-400">You have used all {usage?.limit || 3} free drawings this month.</p>
-          </div>
-          <div className="bg-[#1a1a1a] rounded-xl p-6 mb-6">
-            <div className="flex justify-between items-center mb-4">
-              <span className="text-white font-semibold">Pro Plan</span>
-              <div><span className="text-3xl font-bold text-white">$99</span><span className="text-gray-400">/month</span></div>
-            </div>
-            <ul className="space-y-3 text-sm">
-              {['Unlimited blueprint processing', 'AS9102 Form 3 Excel exports', 'CMM results import', 'Revision comparison (Delta FAI)', 'Multi-page PDF support'].map((feature, i) => (
-                <li key={i} className="flex items-center gap-2 text-gray-300">
-                  <svg className="w-5 h-5 text-green-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-                  {feature}
-                </li>
-              ))}
-            </ul>
-          </div>
-          <a href="/pricing" className="block w-full py-3 bg-[#E63946] hover:bg-[#c62d39] text-white font-semibold rounded-lg text-center transition-colors">Upgrade to Pro</a>
-          <p className="text-center text-gray-500 text-sm mt-4">Free limit resets on the 1st of each month</p>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
-      <div className="bg-[#161616] rounded-2xl max-w-md w-full p-8 relative">
-        <button onClick={onClose} className="absolute top-4 right-4 text-gray-500 hover:text-white">
-          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-        </button>
-        {!submitted ? (
-          <>
-            <div className="text-center mb-6">
-              <div className="w-16 h-16 bg-gradient-to-r from-purple-500/20 to-pink-500/20 rounded-full flex items-center justify-center mx-auto mb-4">
-                <svg className="w-8 h-8 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
-              </div>
-              <h2 className="text-2xl font-bold text-white mb-2">You are Early!</h2>
-              <p className="text-gray-400">AutoBalloon Pro launches in</p>
-            </div>
-            <div className="flex justify-center gap-4 mb-6">
-              <div className="bg-[#1a1a1a] rounded-lg p-3 text-center min-w-[70px]"><div className="text-2xl font-bold text-white">{String(countdown.hours).padStart(2, '0')}</div><div className="text-xs text-gray-500">HOURS</div></div>
-              <div className="bg-[#1a1a1a] rounded-lg p-3 text-center min-w-[70px]"><div className="text-2xl font-bold text-white">{String(countdown.minutes).padStart(2, '0')}</div><div className="text-xs text-gray-500">MINS</div></div>
-              <div className="bg-[#1a1a1a] rounded-lg p-3 text-center min-w-[70px]"><div className="text-2xl font-bold text-white">{String(countdown.seconds).padStart(2, '0')}</div><div className="text-xs text-gray-500">SECS</div></div>
-            </div>
-            <div className="bg-[#1a1a1a] rounded-xl p-4 mb-6"><p className="text-gray-300 text-sm text-center">Be the first to know when we launch. Get <span className="text-[#E63946] font-semibold">50% off</span> as an early supporter.</p></div>
-            <form onSubmit={handleEmailSubmit} className="space-y-4">
-              <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Enter your email" className="w-full px-4 py-3 bg-[#0a0a0a] border border-[#2a2a2a] rounded-lg text-white placeholder-gray-500 focus:border-[#E63946] focus:outline-none" required />
-              <button type="submit" disabled={isSubmitting} className="w-full py-3 bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 text-white font-semibold rounded-lg transition-colors disabled:opacity-50">{isSubmitting ? 'Joining...' : 'Notify Me at Launch'}</button>
-            </form>
-            <p className="text-center text-gray-500 text-xs mt-4">No spam. Just one email when Pro is ready.</p>
-          </>
-        ) : (
-          <div className="text-center py-8">
-            <div className="w-16 h-16 bg-green-500/20 rounded-full flex items-center justify-center mx-auto mb-4"><svg className="w-8 h-8 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg></div>
-            <h2 className="text-2xl font-bold text-white mb-2">You are on the List!</h2>
-            <p className="text-gray-400 mb-4">We will email you the moment AutoBalloon Pro launches.</p>
-            <p className="text-[#E63946] font-semibold">50% early bird discount reserved</p>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ============ REVISION COMPARE ============
-function RevisionCompare({ onClose, onComplete, visitorId, incrementUsage, checkUsageLimit }) {
+// ============ REVISION COMPARE (MODIFIED FOR GLASS WALL) ============
+function RevisionCompare({ onClose, onComplete, visitorId, incrementUsage, isPro, onShowGlassWall }) {
   const [revA, setRevA] = useState(null);
   const [revB, setRevB] = useState(null);
   const [isComparing, setIsComparing] = useState(false);
@@ -277,8 +186,6 @@ function RevisionCompare({ onClose, onComplete, visitorId, incrementUsage, check
 
   const handleCompare = async () => {
     if (!revA || !revB) return;
-    const canProceed = await checkUsageLimit();
-    if (!canProceed) { onClose(); return; }
     setIsComparing(true);
     try {
       const [formDataA, formDataB] = [new FormData(), new FormData()];
@@ -300,6 +207,7 @@ function RevisionCompare({ onClose, onComplete, visitorId, incrementUsage, check
         const filteredA = filterTitleBlock(dimsA);
         const filteredB = filterTitleBlock(dimsB);
         const TOLERANCE = 20;
+        
         filteredB.forEach(dimB => {
           const centerBX = (dimB.bounding_box.xmin + dimB.bounding_box.xmax) / 2;
           const centerBY = (dimB.bounding_box.ymin + dimB.bounding_box.ymax) / 2;
@@ -312,6 +220,7 @@ function RevisionCompare({ onClose, onComplete, visitorId, incrementUsage, check
           else if (matchA.value !== dimB.value) changes.modified.push({ ...dimB, changeType: 'modified', oldValue: matchA.value, newValue: dimB.value });
           else changes.unchanged.push({ ...dimB, changeType: 'unchanged' });
         });
+        
         filteredA.forEach(dimA => {
           const centerAX = (dimA.bounding_box.xmin + dimA.bounding_box.xmax) / 2;
           const centerAY = (dimA.bounding_box.ymin + dimA.bounding_box.ymax) / 2;
@@ -322,13 +231,22 @@ function RevisionCompare({ onClose, onComplete, visitorId, incrementUsage, check
           });
           if (!matchB) changes.removed.push({ ...dimA, changeType: 'removed' });
         });
+        
         setComparisonResult({ revA: dataA, revB: dataB, changes, summary: { added: changes.added.length, removed: changes.removed.length, modified: changes.modified.length, unchanged: changes.unchanged.length } });
       }
-    } catch (err) { console.error('Comparison failed:', err); }
-    finally { setIsComparing(false); }
+    } catch (err) {
+      console.error('Comparison failed:', err);
+    } finally {
+      setIsComparing(false);
+    }
   };
 
   const handleUseChanges = () => {
+    // GLASS WALL: Check if pro before allowing export
+    if (!isPro) {
+      onShowGlassWall();
+      return;
+    }
     if (comparisonResult && onComplete) {
       const changedDimensions = [...comparisonResult.changes.added, ...comparisonResult.changes.modified].map((dim, idx) => ({ ...dim, id: idx + 1 }));
       onComplete({ dimensions: changedDimensions, image: comparisonResult.revB.image, metadata: comparisonResult.revB.metadata, comparison: comparisonResult });
@@ -392,7 +310,10 @@ function RevisionCompare({ onClose, onComplete, visitorId, incrementUsage, check
             </button></>
           ) : (
             <><button onClick={() => setComparisonResult(null)} className="text-gray-400 hover:text-white">Compare Different Files</button>
-            <button onClick={handleUseChanges} className="px-6 py-2 bg-[#E63946] hover:bg-[#c62d39] text-white font-medium rounded-lg">Balloon Only Changes ({comparisonResult.summary.added + comparisonResult.summary.modified})</button></>
+            <button onClick={handleUseChanges} className="px-6 py-2 bg-[#E63946] hover:bg-[#c62d39] text-white font-medium rounded-lg flex items-center gap-2">
+              {!isPro && <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>}
+              Balloon Only Changes ({comparisonResult.summary.added + comparisonResult.summary.modified})
+            </button></>
           )}
         </div>
       </div>
@@ -400,7 +321,7 @@ function RevisionCompare({ onClose, onComplete, visitorId, incrementUsage, check
   );
 }
 
-// ============ PAGE NAVIGATOR (NEW) ============
+// ============ PAGE NAVIGATOR ============
 function PageNavigator({ currentPage, totalPages, onPageChange, gridDetected }) {
   if (totalPages <= 1) return null;
   
@@ -458,8 +379,8 @@ function PageNavigator({ currentPage, totalPages, onPageChange, gridDetected }) 
   );
 }
 
-// ============ DOWNLOAD MENU (NEW) ============
-function DownloadMenu({ onDownloadPDF, onDownloadZIP, onDownloadExcel, isDownloading, totalPages, totalDimensions }) {
+// ============ DOWNLOAD MENU (MODIFIED FOR GLASS WALL) ============
+function DownloadMenu({ onDownloadPDF, onDownloadZIP, onDownloadExcel, isDownloading, totalPages, totalDimensions, isPro }) {
   const [isOpen, setIsOpen] = useState(false);
   const menuRef = useRef(null);
 
@@ -490,12 +411,16 @@ function DownloadMenu({ onDownloadPDF, onDownloadZIP, onDownloadExcel, isDownloa
             <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
             <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
           </svg>
+        ) : !isPro ? (
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+          </svg>
         ) : (
           <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
           </svg>
         )}
-        <span>{isDownloading ? 'Preparing...' : 'Download'}</span>
+        <span>{isDownloading ? 'Preparing...' : (isPro ? 'Download' : 'Export (Pro)')}</span>
         <svg className={`w-4 h-4 transition-transform ${isOpen ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
         </svg>
@@ -517,6 +442,7 @@ function DownloadMenu({ onDownloadPDF, onDownloadZIP, onDownloadExcel, isDownloa
                 <p className="text-sm font-medium text-white">Ballooned PDF</p>
                 <p className="text-xs text-gray-400 mt-0.5">All pages with balloon markers</p>
               </div>
+              {!isPro && <svg className="w-4 h-4 text-gray-500 self-center" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>}
             </button>
 
             <button onClick={() => handleDownload(onDownloadZIP)} className="w-full flex items-start gap-3 p-3 rounded-lg hover:bg-[#252525] transition-colors text-left group">
@@ -527,7 +453,11 @@ function DownloadMenu({ onDownloadPDF, onDownloadZIP, onDownloadExcel, isDownloa
                 <p className="text-sm font-medium text-white">FAI Package (ZIP)</p>
                 <p className="text-xs text-gray-400 mt-0.5">Images + AS9102 Excel + README</p>
               </div>
-              <span className="text-[10px] font-medium text-green-400 bg-green-400/10 px-2 py-0.5 rounded-full self-center">RECOMMENDED</span>
+              {isPro ? (
+                <span className="text-[10px] font-medium text-green-400 bg-green-400/10 px-2 py-0.5 rounded-full self-center">RECOMMENDED</span>
+              ) : (
+                <svg className="w-4 h-4 text-gray-500 self-center" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
+              )}
             </button>
 
             <button onClick={() => handleDownload(onDownloadExcel)} className="w-full flex items-start gap-3 p-3 rounded-lg hover:bg-[#252525] transition-colors text-left group">
@@ -538,11 +468,12 @@ function DownloadMenu({ onDownloadPDF, onDownloadZIP, onDownloadExcel, isDownloa
                 <p className="text-sm font-medium text-white">AS9102 Excel Only</p>
                 <p className="text-xs text-gray-400 mt-0.5">Form 3 spreadsheet</p>
               </div>
+              {!isPro && <svg className="w-4 h-4 text-gray-500 self-center" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>}
             </button>
           </div>
 
           <div className="px-4 py-2.5 border-t border-[#2a2a2a] bg-[#0a0a0a]">
-            <p className="text-[11px] text-gray-500">All exports include AS9102 Rev C compliant formatting</p>
+            <p className="text-[11px] text-gray-500">{isPro ? 'All exports include AS9102 Rev C compliant formatting' : 'Upgrade to Pro to unlock exports'}</p>
           </div>
         </div>
       )}
@@ -550,8 +481,8 @@ function DownloadMenu({ onDownloadPDF, onDownloadZIP, onDownloadExcel, isDownloa
   );
 }
 
-// ============ BLUEPRINT VIEWER WITH MULTI-PAGE SUPPORT ============
-function BlueprintViewer({ result, onReset, token, currentPage, setCurrentPage, totalPages: initialTotalPages }) {
+// ============ BLUEPRINT VIEWER WITH GLASS WALL ============
+function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, currentPage, setCurrentPage, totalPages: initialTotalPages }) {
   const [isExporting, setIsExporting] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
   
@@ -570,7 +501,7 @@ function BlueprintViewer({ result, onReset, token, currentPage, setCurrentPage, 
   const currentPageData = getCurrentPageData();
   const currentImage = hasMultiplePages ? `data:image/png;base64,${currentPageData.image}` : (currentPageData.image?.startsWith('data:') ? currentPageData.image : `data:image/png;base64,${currentPageData.image}`);
   
-  // Get dimensions for current page (with page filtering for multi-page)
+  // Get dimensions for current page
   const getPageDimensions = () => {
     if (hasMultiplePages) {
       return currentPageData.dimensions || [];
@@ -615,8 +546,9 @@ function BlueprintViewer({ result, onReset, token, currentPage, setCurrentPage, 
     return result.dimensions?.length || 0;
   };
   
-  // NEW: Download handlers for multi-page
+  // GLASS WALL: Download handlers with Pro check
   const handleDownloadPDF = async () => {
+    if (!isPro) { onShowGlassWall(); return; }
     setIsDownloading(true);
     try {
       const payload = {
@@ -658,6 +590,7 @@ function BlueprintViewer({ result, onReset, token, currentPage, setCurrentPage, 
   };
 
   const handleDownloadZIP = async () => {
+    if (!isPro) { onShowGlassWall(); return; }
     setIsDownloading(true);
     try {
       const payload = {
@@ -699,6 +632,7 @@ function BlueprintViewer({ result, onReset, token, currentPage, setCurrentPage, 
   };
 
   const handleDownloadExcel = async () => {
+    if (!isPro) { onShowGlassWall(); return; }
     setIsDownloading(true);
     try {
       const payload = {
@@ -739,8 +673,9 @@ function BlueprintViewer({ result, onReset, token, currentPage, setCurrentPage, 
     finally { setIsDownloading(false); }
   };
   
-  // Legacy export (keeping for CSV compatibility)
+  // Legacy export (CSV)
   const handleExport = async (format = 'xlsx') => {
+    if (!isPro) { onShowGlassWall(); return; }
     setIsExporting(true);
     try {
       const allDimensions = hasMultiplePages 
@@ -768,6 +703,7 @@ function BlueprintViewer({ result, onReset, token, currentPage, setCurrentPage, 
   };
 
   const handleDownloadImage = async () => {
+    if (!isPro) { onShowGlassWall(); return; }
     setIsDownloading(true);
     try {
       const canvas = document.createElement('canvas');
@@ -859,7 +795,7 @@ function BlueprintViewer({ result, onReset, token, currentPage, setCurrentPage, 
           </button>
           <div className="h-6 w-px bg-[#2a2a2a]" />
           
-          {/* NEW: Page Navigator */}
+          {/* Page Navigator */}
           {totalPages > 1 && (
             <>
               <PageNavigator 
@@ -883,7 +819,6 @@ function BlueprintViewer({ result, onReset, token, currentPage, setCurrentPage, 
           {result.grid?.detected && !hasMultiplePages && <><div className="h-6 w-px bg-[#2a2a2a]" /><span className="text-sm"><span className="text-gray-400">Grid: </span><span className="text-white font-medium">{result.grid.columns?.length}x{result.grid.rows?.length}</span></span></>}
           {result.metadata?.processing_time_ms && <><div className="h-6 w-px bg-[#2a2a2a]" /><span className="text-sm"><span className="text-gray-400">Time: </span><span className="text-white font-medium">{(result.metadata.processing_time_ms / 1000).toFixed(1)}s</span></span></>}
           
-          {/* Show message if pages were truncated */}
           {result.message && (
             <span className="text-amber-400 text-sm bg-amber-400/10 px-3 py-1 rounded-full">{result.message}</span>
           )}
@@ -906,12 +841,16 @@ function BlueprintViewer({ result, onReset, token, currentPage, setCurrentPage, 
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
             Import CMM
           </button>
-          <button onClick={handleDownloadImage} disabled={isDownloading} className="px-4 py-2 bg-[#1a1a1a] hover:bg-[#252525] text-gray-300 rounded-lg transition-colors text-sm disabled:opacity-50">
+          <button onClick={handleDownloadImage} disabled={isDownloading} className="px-4 py-2 bg-[#1a1a1a] hover:bg-[#252525] text-gray-300 rounded-lg transition-colors text-sm disabled:opacity-50 flex items-center gap-2">
+            {!isPro && <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>}
             {isDownloading ? 'Saving...' : `Save Page ${currentPage}`}
           </button>
-          <button onClick={() => handleExport('csv')} disabled={isExporting} className="px-4 py-2 bg-[#1a1a1a] hover:bg-[#252525] text-gray-300 rounded-lg transition-colors text-sm disabled:opacity-50">Export CSV</button>
+          <button onClick={() => handleExport('csv')} disabled={isExporting} className="px-4 py-2 bg-[#1a1a1a] hover:bg-[#252525] text-gray-300 rounded-lg transition-colors text-sm disabled:opacity-50 flex items-center gap-2">
+            {!isPro && <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>}
+            Export CSV
+          </button>
           
-          {/* NEW: Download Menu for multi-page exports */}
+          {/* Download Menu with Glass Wall */}
           <DownloadMenu
             onDownloadPDF={handleDownloadPDF}
             onDownloadZIP={handleDownloadZIP}
@@ -919,6 +858,7 @@ function BlueprintViewer({ result, onReset, token, currentPage, setCurrentPage, 
             isDownloading={isDownloading}
             totalPages={totalPages}
             totalDimensions={getTotalDimensions()}
+            isPro={isPro}
           />
         </div>
       </div>
@@ -941,6 +881,10 @@ function BlueprintViewer({ result, onReset, token, currentPage, setCurrentPage, 
         {dimensions.map((dim) => (
           <DraggableBalloon key={dim.id} dimension={dim} left={dim.balloonX} top={dim.balloonY} onDelete={() => handleDeleteDimension(dim.id)} onDrag={handleBalloonDrag} cmmResult={cmmResults[dim.id]} containerRef={containerRef} />
         ))}
+        
+        {/* GLASS WALL: Preview Watermark for non-pro users */}
+        {!isPro && <PreviewWatermark isVisible={true} />}
+        
         {isAddingBalloon && <div className="absolute inset-0 bg-black/30 flex items-center justify-center pointer-events-none"><span className="bg-[#E63946] text-white px-4 py-2 rounded-lg text-sm">Click to place balloon</span></div>}
       </div>
 
