@@ -7,6 +7,8 @@ Strategy:
 2. Gemini identifies which text values are dimensions (semantic filtering)
 3. This service matches Gemini's dimension list against OCR results
 4. Output: Only dimensions, with precise bounding boxes from OCR
+
+IMPROVED: Better numeric matching to avoid misplacement of balloons
 """
 import re
 from typing import Optional
@@ -155,6 +157,30 @@ class DetectionService:
         
         return matched
     
+    def _extract_primary_number(self, text: str) -> Optional[str]:
+        """
+        Extract the primary numeric value from a dimension string.
+        
+        Examples:
+            "Ø7.5 (2x)" -> "7.5"
+            "Ø3.4" -> "3.4"
+            "35 C/C" -> "35"
+            "M8×1.25" -> "8"
+            "89.5°" -> "89.5"
+            "R5 TYP" -> "5"
+        """
+        # Remove common prefixes/symbols
+        cleaned = text.replace('Ø', '').replace('⌀', '').replace('R', '').replace('M', '')
+        cleaned = cleaned.replace('°', '').replace('±', ' ').replace('×', ' ').replace('x', ' ')
+        
+        # Find all numbers (including decimals)
+        numbers = re.findall(r'\d+\.?\d*', cleaned)
+        
+        if numbers:
+            # Return the first (primary) number
+            return numbers[0]
+        return None
+    
     def _find_best_ocr_match(
         self,
         dimension_value: str,
@@ -164,37 +190,88 @@ class DetectionService:
         """
         Find the OCR detection that best matches the dimension value.
         
+        IMPROVED: Prioritizes exact numeric matches to avoid misplacement.
+        
         Returns tuple of (OCRDetection, match_confidence) or None.
         """
+        # Extract the primary number from the dimension (e.g., "Ø7.5 (2x)" -> "7.5")
+        dim_primary_number = self._extract_primary_number(dimension_value)
+        
         # Normalize the dimension value for matching
         normalized_dim = self._normalize_for_matching(dimension_value)
         
         best_match = None
         best_score = 0.0
         
+        # === PASS 1: Look for exact primary number match ===
+        # This is the most reliable matching strategy
+        if dim_primary_number:
+            for ocr in ocr_detections:
+                if id(ocr) in used_indices:
+                    continue
+                
+                ocr_primary_number = self._extract_primary_number(ocr.text)
+                
+                # Exact primary number match (e.g., "7.5" == "7.5")
+                if ocr_primary_number and ocr_primary_number == dim_primary_number:
+                    # High confidence - exact number match
+                    return (ocr, 0.95)
+        
+        # === PASS 2: Look for exact normalized match ===
         for ocr in ocr_detections:
             if id(ocr) in used_indices:
                 continue
             
             normalized_ocr = self._normalize_for_matching(ocr.text)
             
-            # Try exact match first
+            # Exact normalized match
             if normalized_dim == normalized_ocr:
                 return (ocr, 1.0)
-            
-            # Try containment (OCR text contains dimension or vice versa)
-            if normalized_dim in normalized_ocr or normalized_ocr in normalized_dim:
-                score = min(len(normalized_dim), len(normalized_ocr)) / max(len(normalized_dim), len(normalized_ocr))
-                if score > best_score:
-                    best_score = score
-                    best_match = ocr
+        
+        # === PASS 3: Look for containment matches ===
+        # Only if the primary number also matches (to avoid wrong matches)
+        for ocr in ocr_detections:
+            if id(ocr) in used_indices:
                 continue
             
-            # Fuzzy match for OCR errors
-            score = self._fuzzy_match_score(normalized_dim, normalized_ocr)
-            if score > best_score and score > 0.7:  # Minimum threshold
-                best_score = score
-                best_match = ocr
+            normalized_ocr = self._normalize_for_matching(ocr.text)
+            ocr_primary_number = self._extract_primary_number(ocr.text)
+            
+            # Containment check WITH primary number validation
+            if normalized_dim in normalized_ocr or normalized_ocr in normalized_dim:
+                # Verify primary numbers match to avoid "3.4" matching "Ø7.5"
+                if dim_primary_number and ocr_primary_number:
+                    if dim_primary_number == ocr_primary_number:
+                        score = min(len(normalized_dim), len(normalized_ocr)) / max(len(normalized_dim), len(normalized_ocr))
+                        if score > best_score:
+                            best_score = score
+                            best_match = ocr
+                else:
+                    # No primary numbers to compare, use length ratio
+                    score = min(len(normalized_dim), len(normalized_ocr)) / max(len(normalized_dim), len(normalized_ocr))
+                    if score > best_score:
+                        best_score = score
+                        best_match = ocr
+        
+        # === PASS 4: Fuzzy match (last resort) ===
+        # Only if no better match found and primary numbers match
+        if not best_match or best_score < 0.7:
+            for ocr in ocr_detections:
+                if id(ocr) in used_indices:
+                    continue
+                
+                normalized_ocr = self._normalize_for_matching(ocr.text)
+                ocr_primary_number = self._extract_primary_number(ocr.text)
+                
+                # Require primary number match for fuzzy matching
+                if dim_primary_number and ocr_primary_number:
+                    if dim_primary_number != ocr_primary_number:
+                        continue  # Skip if primary numbers don't match
+                
+                score = self._fuzzy_match_score(normalized_dim, normalized_ocr)
+                if score > best_score and score > 0.7:  # Minimum threshold
+                    best_score = score
+                    best_match = ocr
         
         if best_match:
             return (best_match, best_score)
