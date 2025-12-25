@@ -1,212 +1,304 @@
 """
-File Service
-Handles PDF and image file processing, converting all inputs to normalized PNG images.
+File Service - Multi-Page PDF Processing
+Handles PDF page extraction, image conversion, and file validation.
+
+Supports:
+- Multi-page PDF extraction (up to 20 pages)
+- High-resolution PNG conversion for each page
+- Single image passthrough
+
+Uses pdf2image (with poppler backend) for PDF to image conversion.
 """
-import base64
 import io
-import tempfile
-from pathlib import Path
-from typing import Tuple, Optional
+import base64
+from typing import Optional, List, Tuple
+from dataclasses import dataclass
+from enum import Enum
 from PIL import Image
-import fitz  # PyMuPDF
-
-from config import (
-    MAX_FILE_SIZE_BYTES,
-    ALLOWED_EXTENSIONS,
-    TARGET_DPI,
-)
-from models import ErrorCode
+from pdf2image import convert_from_bytes
+from pypdf import PdfReader
 
 
-class FileServiceError(Exception):
-    """Custom exception for file service errors"""
-    def __init__(self, code: ErrorCode, message: str):
-        self.code = code
-        self.message = message
-        super().__init__(message)
+class FileType(Enum):
+    """Supported file types"""
+    PDF = "pdf"
+    PNG = "png"
+    JPEG = "jpeg"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class PageImage:
+    """Represents a single page converted to image"""
+    page_number: int
+    image_bytes: bytes
+    width: int
+    height: int
+    base64_image: str  # For API response
+
+
+@dataclass
+class FileProcessingResult:
+    """Result of file processing"""
+    success: bool
+    file_type: FileType
+    total_pages: int
+    pages: List[PageImage]
+    error_message: Optional[str] = None
 
 
 class FileService:
     """
-    Converts uploaded files (PDF, PNG, JPEG, TIFF) to normalized PNG images
-    suitable for OCR and vision API processing.
+    Handles multi-page PDF and image file processing.
     """
     
-    def __init__(self, target_dpi: int = TARGET_DPI):
-        self.target_dpi = target_dpi
+    # Configuration
+    MAX_PAGES = 20  # Maximum pages to process
+    DEFAULT_DPI = 200  # Resolution for PDF to image conversion
+    MAX_IMAGE_DIMENSION = 4096  # Maximum width/height for images
     
-    def validate_file(self, file_content: bytes, filename: str) -> None:
+    def __init__(self, max_pages: int = 20, dpi: int = 200):
         """
-        Validate file size and extension.
-        Raises FileServiceError if invalid.
-        """
-        # Check file size
-        if len(file_content) > MAX_FILE_SIZE_BYTES:
-            raise FileServiceError(
-                ErrorCode.FILE_TOO_LARGE,
-                f"File exceeds maximum size of {MAX_FILE_SIZE_BYTES // (1024*1024)}MB"
-            )
-        
-        # Check extension
-        ext = Path(filename).suffix.lower()
-        if ext not in ALLOWED_EXTENSIONS:
-            raise FileServiceError(
-                ErrorCode.UNSUPPORTED_FORMAT,
-                f"Unsupported file format: {ext}. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
-            )
-    
-    def get_file_type(self, filename: str) -> str:
-        """Determine file type from extension"""
-        ext = Path(filename).suffix.lower()
-        if ext == ".pdf":
-            return "pdf"
-        elif ext in {".png", ".jpg", ".jpeg"}:
-            return "image"
-        elif ext in {".tiff", ".tif"}:
-            return "tiff"
-        return "unknown"
-    
-    def process_file(self, file_content: bytes, filename: str) -> Tuple[bytes, str, int, int]:
-        """
-        Process uploaded file and convert to normalized PNG.
+        Initialize file service.
         
         Args:
-            file_content: Raw file bytes
-            filename: Original filename
+            max_pages: Maximum number of pages to process (default 20)
+            dpi: DPI for PDF to image conversion (default 200)
+        """
+        self.max_pages = max_pages
+        self.dpi = dpi
+    
+    def detect_file_type(self, file_bytes: bytes, filename: Optional[str] = None) -> FileType:
+        """
+        Detect file type from bytes and/or filename.
+        
+        Args:
+            file_bytes: Raw file bytes
+            filename: Optional filename with extension
             
         Returns:
-            Tuple of (png_bytes, original_format, width, height)
+            Detected FileType
+        """
+        # Check magic bytes first
+        if file_bytes[:4] == b'%PDF':
+            return FileType.PDF
+        if file_bytes[:8] == b'\x89PNG\r\n\x1a\n':
+            return FileType.PNG
+        if file_bytes[:2] == b'\xff\xd8':
+            return FileType.JPEG
+        
+        # Fallback to filename extension
+        if filename:
+            ext = filename.lower().split('.')[-1]
+            if ext == 'pdf':
+                return FileType.PDF
+            if ext == 'png':
+                return FileType.PNG
+            if ext in ('jpg', 'jpeg'):
+                return FileType.JPEG
+        
+        return FileType.UNKNOWN
+    
+    def process_file(
+        self, 
+        file_bytes: bytes, 
+        filename: Optional[str] = None
+    ) -> FileProcessingResult:
+        """
+        Process uploaded file, extracting pages as images.
+        
+        For PDFs: Converts each page to a high-resolution PNG
+        For images: Returns single page with original image
+        
+        Args:
+            file_bytes: Raw file bytes
+            filename: Optional filename
             
-        Raises:
-            FileServiceError: If file cannot be processed
+        Returns:
+            FileProcessingResult with page images
         """
-        self.validate_file(file_content, filename)
+        file_type = self.detect_file_type(file_bytes, filename)
         
-        file_type = self.get_file_type(filename)
-        
-        try:
-            if file_type == "pdf":
-                png_bytes, width, height = self._process_pdf(file_content)
-                return png_bytes, "pdf", width, height
-            else:
-                png_bytes, width, height = self._process_image(file_content)
-                return png_bytes, file_type, width, height
-        except FileServiceError:
-            raise
-        except Exception as e:
-            raise FileServiceError(
-                ErrorCode.PROCESSING_ERROR,
-                f"Failed to process file: {str(e)}"
-            )
-    
-    def _process_pdf(self, pdf_content: bytes) -> Tuple[bytes, int, int]:
-        """
-        Convert first page of PDF to high-resolution PNG.
-        Uses PyMuPDF (fitz) for PDF rendering.
-        """
-        try:
-            doc = fitz.open(stream=pdf_content, filetype="pdf")
-        except Exception as e:
-            raise FileServiceError(
-                ErrorCode.INVALID_FILE,
-                f"Could not open PDF: {str(e)}"
-            )
-        
-        if doc.page_count == 0:
-            doc.close()
-            raise FileServiceError(
-                ErrorCode.INVALID_FILE,
-                "PDF has no pages"
-            )
-        
-        # Get first page
-        page = doc[0]
-        
-        # Calculate zoom factor for target DPI
-        # PDF default is 72 DPI
-        zoom = self.target_dpi / 72.0
-        matrix = fitz.Matrix(zoom, zoom)
-        
-        # Render page to pixmap
-        pixmap = page.get_pixmap(matrix=matrix, alpha=False)
-        
-        # Convert to PNG bytes
-        png_bytes = pixmap.tobytes("png")
-        width = pixmap.width
-        height = pixmap.height
-        
-        doc.close()
-        
-        return png_bytes, width, height
-    
-    def _process_image(self, image_content: bytes) -> Tuple[bytes, int, int]:
-        """
-        Process image file (PNG, JPEG, TIFF) and normalize to PNG.
-        Preserves original resolution but ensures consistent format.
-        """
-        try:
-            image = Image.open(io.BytesIO(image_content))
-        except Exception as e:
-            raise FileServiceError(
-                ErrorCode.INVALID_FILE,
-                f"Could not open image: {str(e)}"
-            )
-        
-        # Convert to RGB if necessary (handles CMYK, RGBA, etc.)
-        if image.mode not in ("RGB", "L"):
-            image = image.convert("RGB")
-        
-        # Get dimensions
-        width, height = image.size
-        
-        # For TIFF with multiple pages, use first page only
-        if hasattr(image, 'n_frames') and image.n_frames > 1:
-            image.seek(0)
-        
-        # Convert to PNG bytes
-        output = io.BytesIO()
-        image.save(output, format="PNG", optimize=True)
-        png_bytes = output.getvalue()
-        
-        return png_bytes, width, height
-    
-    def to_base64(self, png_bytes: bytes) -> str:
-        """Convert PNG bytes to base64 data URI"""
-        b64 = base64.b64encode(png_bytes).decode("utf-8")
-        return f"data:image/png;base64,{b64}"
-    
-    def from_base64(self, data_uri: str) -> bytes:
-        """Extract PNG bytes from base64 data URI"""
-        if data_uri.startswith("data:"):
-            # Remove data URI prefix
-            _, b64_data = data_uri.split(",", 1)
+        if file_type == FileType.PDF:
+            return self._process_pdf(file_bytes)
+        elif file_type in (FileType.PNG, FileType.JPEG):
+            return self._process_image(file_bytes, file_type)
         else:
-            b64_data = data_uri
-        return base64.b64decode(b64_data)
+            return FileProcessingResult(
+                success=False,
+                file_type=FileType.UNKNOWN,
+                total_pages=0,
+                pages=[],
+                error_message="Unsupported file type. Please upload a PDF, PNG, or JPEG."
+            )
     
-    def create_thumbnail(self, png_bytes: bytes, max_width: int = 200) -> str:
+    def _process_pdf(self, pdf_bytes: bytes) -> FileProcessingResult:
         """
-        Create a smaller thumbnail for history storage.
-        Returns base64 JPEG data URI.
+        Process multi-page PDF, converting each page to PNG.
+        
+        Args:
+            pdf_bytes: Raw PDF file bytes
+            
+        Returns:
+            FileProcessingResult with all page images
         """
-        image = Image.open(io.BytesIO(png_bytes))
+        try:
+            # Get total page count using pypdf
+            pdf_reader = PdfReader(io.BytesIO(pdf_bytes))
+            total_pages = len(pdf_reader.pages)
+            
+            # Determine pages to process
+            pages_to_process = min(total_pages, self.max_pages)
+            
+            # Convert PDF pages to images using pdf2image
+            # pdf2image returns a list of PIL Image objects
+            pil_images = convert_from_bytes(
+                pdf_bytes,
+                dpi=self.dpi,
+                first_page=1,
+                last_page=pages_to_process,
+                fmt='png'
+            )
+            
+            # Convert each PIL image to our PageImage format
+            pages = []
+            for page_num, pil_img in enumerate(pil_images, start=1):
+                # Convert PIL image to PNG bytes
+                png_buffer = io.BytesIO()
+                pil_img.save(png_buffer, format='PNG')
+                png_bytes = png_buffer.getvalue()
+                
+                # Get dimensions
+                width, height = pil_img.size
+                
+                # Encode to base64
+                base64_image = base64.b64encode(png_bytes).decode('utf-8')
+                
+                pages.append(PageImage(
+                    page_number=page_num,
+                    image_bytes=png_bytes,
+                    width=width,
+                    height=height,
+                    base64_image=base64_image
+                ))
+            
+            warning_msg = None
+            if total_pages > self.max_pages:
+                warning_msg = f"Processed {pages_to_process} of {total_pages} pages (max {self.max_pages})"
+            
+            return FileProcessingResult(
+                success=True,
+                file_type=FileType.PDF,
+                total_pages=total_pages,
+                pages=pages,
+                error_message=warning_msg
+            )
+            
+        except Exception as e:
+            return FileProcessingResult(
+                success=False,
+                file_type=FileType.PDF,
+                total_pages=0,
+                pages=[],
+                error_message=f"Failed to process PDF: {str(e)}"
+            )
+    
+    def _process_image(
+        self, 
+        image_bytes: bytes, 
+        file_type: FileType
+    ) -> FileProcessingResult:
+        """
+        Process single image file.
         
-        # Calculate new dimensions maintaining aspect ratio
-        ratio = max_width / image.width
-        new_height = int(image.height * ratio)
+        Args:
+            image_bytes: Raw image bytes
+            file_type: Detected file type
+            
+        Returns:
+            FileProcessingResult with single page
+        """
+        try:
+            # Open image to get dimensions and potentially convert
+            img = Image.open(io.BytesIO(image_bytes))
+            width, height = img.size
+            
+            # Convert to PNG if JPEG (for consistency)
+            if file_type == FileType.JPEG:
+                png_buffer = io.BytesIO()
+                img.save(png_buffer, format='PNG')
+                png_bytes = png_buffer.getvalue()
+            else:
+                png_bytes = image_bytes
+            
+            # Encode to base64
+            base64_image = base64.b64encode(png_bytes).decode('utf-8')
+            
+            page = PageImage(
+                page_number=1,
+                image_bytes=png_bytes,
+                width=width,
+                height=height,
+                base64_image=base64_image
+            )
+            
+            return FileProcessingResult(
+                success=True,
+                file_type=file_type,
+                total_pages=1,
+                pages=[page]
+            )
+            
+        except Exception as e:
+            return FileProcessingResult(
+                success=False,
+                file_type=file_type,
+                total_pages=0,
+                pages=[],
+                error_message=f"Failed to process image: {str(e)}"
+            )
+    
+    def get_page_as_png(
+        self, 
+        pdf_bytes: bytes, 
+        page_number: int
+    ) -> Optional[Tuple[bytes, int, int]]:
+        """
+        Extract a specific page from PDF as PNG.
         
-        # Resize
-        image = image.resize((max_width, new_height), Image.Resampling.LANCZOS)
-        
-        # Convert to JPEG for smaller size
-        if image.mode != "RGB":
-            image = image.convert("RGB")
-        
-        output = io.BytesIO()
-        image.save(output, format="JPEG", quality=70, optimize=True)
-        
-        b64 = base64.b64encode(output.getvalue()).decode("utf-8")
-        return f"data:image/jpeg;base64,{b64}"
+        Args:
+            pdf_bytes: Raw PDF bytes
+            page_number: Page number (1-indexed)
+            
+        Returns:
+            Tuple of (png_bytes, width, height) or None if failed
+        """
+        try:
+            # Convert just the requested page
+            pil_images = convert_from_bytes(
+                pdf_bytes,
+                dpi=self.dpi,
+                first_page=page_number,
+                last_page=page_number,
+                fmt='png'
+            )
+            
+            if not pil_images:
+                return None
+            
+            pil_img = pil_images[0]
+            
+            # Convert to PNG bytes
+            png_buffer = io.BytesIO()
+            pil_img.save(png_buffer, format='PNG')
+            png_bytes = png_buffer.getvalue()
+            
+            width, height = pil_img.size
+            
+            return (png_bytes, width, height)
+            
+        except Exception:
+            return None
 
 
 # Singleton instance
