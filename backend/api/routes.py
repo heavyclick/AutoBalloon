@@ -1,312 +1,231 @@
 """
-API Routes
-FastAPI endpoints for AutoBalloon - Core processing functionality
+API Routes - Multi-Page Support
+Handles file upload, multi-page processing, and export generation.
 """
-import time
-from datetime import datetime
-from typing import Optional
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Header
+from typing import Optional, List
+from fastapi import APIRouter, File, UploadFile, HTTPException, Form, Query
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 import io
 
-from models import (
-    ProcessResponse,
-    ProcessingMetadata,
-    GridInfo,
-    Dimension,
-    BoundingBox,
-    ErrorCode,
-    ErrorResponse,
-    ExportRequest,
-    ExportFormat,
-    ExportTemplate,
-    ExportMetadata,
-    UpdateBalloonRequest,
-    UpdateBalloonResponse,
-    AddBalloonRequest,
-    AddBalloonResponse,
-    HealthResponse,
-)
-from services import (
-    file_service,
-    FileServiceError,
-    create_detection_service,
-    create_vision_service,
-    create_grid_service,
-    export_service,
-    usage_service,
-    history_service,
-    auth_service,
-    User,
-)
-from config import GOOGLE_CLOUD_API_KEY, GEMINI_API_KEY
+from services.detection_service import DetectionService, create_detection_service
+from services.export_service import ExportService, export_service
+from services.file_service import FileService, file_service
+from models import ExportFormat, ExportTemplate, ExportMetadata
 
-router = APIRouter(prefix="/api")
+
+router = APIRouter()
 
 
 # ==================
-# Dependencies
+# Request/Response Models
 # ==================
 
-async def get_optional_user(authorization: Optional[str] = Header(None)) -> Optional[User]:
-    """Get current user if authenticated, None otherwise"""
-    if not authorization:
-        return None
-    
-    parts = authorization.split()
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        return None
-    
-    return auth_service.get_current_user(parts[1])
+class DimensionResponse(BaseModel):
+    """Single dimension in API response"""
+    id: int
+    value: str
+    zone: Optional[str]
+    page: int = 1
+    bounding_box: dict
+    confidence: float
 
 
-def get_detection_service():
-    """Get detection service with API keys from config"""
+class PageResponse(BaseModel):
+    """Single page in API response"""
+    page_number: int
+    image: str  # base64 encoded PNG
+    width: int
+    height: int
+    dimensions: List[DimensionResponse]
+    grid_detected: bool
+
+
+class ProcessingResponse(BaseModel):
+    """Full processing response"""
+    success: bool
+    total_pages: int
+    pages: List[PageResponse]
+    all_dimensions: List[DimensionResponse]
+    message: Optional[str] = None
+
+
+class ExportRequest(BaseModel):
+    """Export request body"""
+    dimensions: List[dict]  # Dimension data from frontend
+    format: str = "xlsx"  # "csv" or "xlsx"
+    template: str = "AS9102_FORM3"  # "SIMPLE" or "AS9102_FORM3"
+    part_number: Optional[str] = None
+    part_name: Optional[str] = None
+    revision: Optional[str] = None
+    total_pages: int = 1
+    grid_detected: bool = True
+
+
+# ==================
+# Dependency Injection
+# ==================
+
+def get_detection_service() -> DetectionService:
+    """Get configured detection service"""
+    import os
     return create_detection_service(
-        ocr_api_key=GOOGLE_CLOUD_API_KEY or None,
-        gemini_api_key=GEMINI_API_KEY or None
+        ocr_api_key=os.getenv("GOOGLE_CLOUD_API_KEY"),
+        gemini_api_key=os.getenv("GEMINI_API_KEY")
     )
 
 
-def get_grid_service():
-    """Get grid service with Gemini vision"""
-    vision_service = None
-    if GEMINI_API_KEY:
-        vision_service = create_vision_service(GEMINI_API_KEY)
-    return create_grid_service(vision_service)
-
-
 # ==================
-# Endpoints
+# API Endpoints
 # ==================
 
-@router.get("/health", response_model=HealthResponse)
-async def health_check():
-    """Health check endpoint"""
-    return HealthResponse(
-        status="healthy",
-        version="1.0.0"
-    )
-
-
-@router.post("/process", response_model=ProcessResponse)
-async def process_file(
+@router.post("/process", response_model=ProcessingResponse)
+async def process_drawing(
     file: UploadFile = File(...),
-    visitor_id: Optional[str] = None,
-    detection_service=Depends(get_detection_service),
-    grid_service=Depends(get_grid_service),
-    user: Optional[User] = Depends(get_optional_user)
+    detection_service: DetectionService = None
 ):
     """
-    Process a manufacturing blueprint and detect dimensions.
+    Process uploaded engineering drawing (PDF or image).
     
-    Accepts: PDF, PNG, JPEG, TIFF (max 25MB)
-    Returns: Base64 image, detected dimensions with zones, grid info
+    Supports:
+    - Multi-page PDF (up to 20 pages)
+    - Single images (PNG, JPEG)
     
-    Usage limits:
-    - Free users: 3 drawings/month
-    - Pro users: Unlimited
+    Returns:
+    - All pages with base64 images
+    - Dimensions with sequential balloon numbers across all pages
+    - Grid detection status per page
     """
-    start_time = time.time()
+    if detection_service is None:
+        detection_service = get_detection_service()
     
-    # Check usage limits (before processing)
-    if user:
-        can_process = usage_service.can_process(user_id=user.id, is_pro=user.is_pro)
-    elif visitor_id:
-        can_process = usage_service.can_process(visitor_id=visitor_id)
-    else:
-        # No tracking info - allow but log warning
-        can_process = True
+    # Read file bytes
+    file_bytes = await file.read()
     
-    if not can_process:
-        return ProcessResponse(
-            success=False,
-            error={
-                "code": "USAGE_LIMIT_EXCEEDED",
-                "message": "You've reached your free limit. Upgrade to Pro for unlimited processing."
-            }
-        )
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Empty file uploaded")
     
-    # Read file content
-    try:
-        content = await file.read()
-    except Exception as e:
+    # Process file (handles both PDF and images)
+    result = await detection_service.detect_dimensions_multipage(
+        file_bytes=file_bytes,
+        filename=file.filename
+    )
+    
+    if not result.success:
         raise HTTPException(
-            status_code=400,
-            detail={"code": ErrorCode.INVALID_FILE.value, "message": str(e)}
+            status_code=422, 
+            detail=result.error_message or "Failed to process file"
         )
     
-    # Process file to normalized PNG
-    try:
-        png_bytes, original_format, width, height = file_service.process_file(
-            content, 
-            file.filename or "upload.pdf"
+    # Convert to response format
+    pages = []
+    for page_result in result.pages:
+        page_dimensions = [
+            DimensionResponse(
+                id=dim.id,
+                value=dim.value,
+                zone=dim.zone,
+                page=dim.page,
+                bounding_box={
+                    "xmin": dim.bounding_box.xmin,
+                    "ymin": dim.bounding_box.ymin,
+                    "xmax": dim.bounding_box.xmax,
+                    "ymax": dim.bounding_box.ymax,
+                    "center_x": dim.bounding_box.center_x,
+                    "center_y": dim.bounding_box.center_y
+                },
+                confidence=dim.confidence
+            )
+            for dim in page_result.dimensions
+        ]
+        
+        pages.append(PageResponse(
+            page_number=page_result.page_number,
+            image=page_result.image_base64,
+            width=page_result.width,
+            height=page_result.height,
+            dimensions=page_dimensions,
+            grid_detected=page_result.grid_detected
+        ))
+    
+    # Flatten all dimensions for response
+    all_dimensions = [
+        DimensionResponse(
+            id=dim.id,
+            value=dim.value,
+            zone=dim.zone,
+            page=dim.page,
+            bounding_box={
+                "xmin": dim.bounding_box.xmin,
+                "ymin": dim.bounding_box.ymin,
+                "xmax": dim.bounding_box.xmax,
+                "ymax": dim.bounding_box.ymax,
+                "center_x": dim.bounding_box.center_x,
+                "center_y": dim.bounding_box.center_y
+            },
+            confidence=dim.confidence
         )
-    except FileServiceError as e:
-        return ProcessResponse(
-            success=False,
-            error={"code": e.code.value, "message": e.message}
-        )
+        for dim in result.all_dimensions
+    ]
     
-    # Detect grid
-    grid_info = await grid_service.detect_grid(png_bytes)
-    
-    # Detect dimensions
-    try:
-        dimensions = await detection_service.detect_dimensions(
-            png_bytes, width, height
-        )
-    except Exception as e:
-        # Return partial result with image but no dimensions
-        return ProcessResponse(
-            success=True,
-            image=file_service.to_base64(png_bytes),
-            dimensions=[],
-            grid=grid_info,
-            metadata=ProcessingMetadata(
-                filename=file.filename or "upload",
-                original_format=original_format,
-                processed_at=datetime.utcnow(),
-                dimension_count=0,
-                processing_time_ms=int((time.time() - start_time) * 1000)
-            ),
-            error={"code": ErrorCode.PROCESSING_ERROR.value, "message": str(e)}
-        )
-    
-    # Assign zones to dimensions
-    if grid_info.detected:
-        grid_service.assign_zones_to_dimensions(dimensions)
-    
-    # Calculate processing time
-    processing_time_ms = int((time.time() - start_time) * 1000)
-    
-    # Increment usage count (after successful processing)
-    if user:
-        usage_service.increment_user_usage(user.id, user.is_pro)
-    elif visitor_id:
-        usage_service.increment_anonymous_usage(visitor_id)
-    
-    # Save to history for Pro users
-    if user and user.is_pro and history_service.get_history_enabled(user.id):
-        thumbnail = file_service.create_thumbnail(png_bytes)
-        history_service.add_entry(
-            user_id=user.id,
-            filename=file.filename or "upload",
-            thumbnail=thumbnail,
-            dimensions=[d.model_dump() for d in dimensions],
-            image_data=file_service.to_base64(png_bytes),
-            grid=grid_info.model_dump() if grid_info else None,
-            processing_time_ms=processing_time_ms
-        )
-    
-    return ProcessResponse(
+    return ProcessingResponse(
         success=True,
-        image=file_service.to_base64(png_bytes),
-        dimensions=dimensions,
-        grid=grid_info,
-        metadata=ProcessingMetadata(
-            filename=file.filename or "upload",
-            original_format=original_format,
-            processed_at=datetime.utcnow(),
-            dimension_count=len(dimensions),
-            processing_time_ms=processing_time_ms
-        )
+        total_pages=result.total_pages,
+        pages=pages,
+        all_dimensions=all_dimensions,
+        message=result.error_message  # e.g., "Processed 20 of 25 pages"
     )
 
 
 @router.post("/export")
-async def export_inspection(request: ExportRequest):
+async def export_inspection_data(request: ExportRequest):
     """
-    Export inspection data to CSV or Excel.
+    Export dimension data to CSV or AS9102 Excel.
     
-    Supports AS9102 Form 3 format for aerospace compliance.
+    Supports:
+    - CSV format (simple)
+    - Excel with AS9102 Form 3 template
+    - Multi-page drawings with Sheet column
     """
-    try:
-        # Convert metadata if provided
-        metadata = None
-        if request.metadata:
-            metadata = ExportMetadata(
-                part_number=request.metadata.part_number,
-                part_name=request.metadata.part_name,
-                revision=request.metadata.revision
-            )
-        
-        # Generate export
-        file_bytes, content_type, filename = export_service.generate_export(
-            dimensions=request.dimensions,
-            format=request.format,
-            template=request.template,
-            metadata=metadata,
-            filename=request.filename
+    # Parse format and template
+    export_format = ExportFormat.CSV if request.format.lower() == "csv" else ExportFormat.XLSX
+    export_template = (
+        ExportTemplate.SIMPLE 
+        if request.template.upper() == "SIMPLE" 
+        else ExportTemplate.AS9102_FORM3
+    )
+    
+    # Build metadata
+    metadata = None
+    if request.part_number or request.part_name or request.revision:
+        metadata = ExportMetadata(
+            part_number=request.part_number,
+            part_name=request.part_name,
+            revision=request.revision
         )
-        
-        # Return as downloadable file
-        return StreamingResponse(
-            io.BytesIO(file_bytes),
-            media_type=content_type,
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"'
-            }
-        )
-        
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail={"code": "EXPORT_ERROR", "message": str(e)}
-        )
+    
+    # Generate export
+    file_bytes, content_type, filename = export_service.generate_export(
+        dimensions=request.dimensions,
+        format=export_format,
+        template=export_template,
+        metadata=metadata,
+        filename="inspection",
+        grid_detected=request.grid_detected,
+        total_pages=request.total_pages
+    )
+    
+    # Return as downloadable file
+    return StreamingResponse(
+        io.BytesIO(file_bytes),
+        media_type=content_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        }
+    )
 
 
-@router.post("/update-balloon", response_model=UpdateBalloonResponse)
-async def update_balloon(
-    request: UpdateBalloonRequest,
-    grid_service=Depends(get_grid_service)
-):
-    """
-    Update a balloon's position after user drag.
-    Recalculates zone based on new position.
-    """
-    try:
-        new_zone = grid_service.recalculate_zone(request.new_bounding_box)
-        
-        return UpdateBalloonResponse(
-            success=True,
-            updated_zone=new_zone
-        )
-    except Exception as e:
-        return UpdateBalloonResponse(
-            success=False,
-            updated_zone=None
-        )
-
-
-@router.post("/add-balloon", response_model=AddBalloonResponse)
-async def add_balloon(
-    request: AddBalloonRequest,
-    grid_service=Depends(get_grid_service)
-):
-    """
-    Manually add a new balloon at a user-specified position.
-    """
-    try:
-        # Calculate zone for the new position
-        zone = grid_service.assign_zone(request.bounding_box)
-        
-        # Create new dimension (ID will be assigned by frontend)
-        new_dimension = Dimension(
-            id=0,  # Frontend assigns the actual ID
-            value=request.value,
-            zone=zone,
-            bounding_box=request.bounding_box,
-            confidence=1.0,  # User-added = full confidence
-            manually_added=True
-        )
-        
-        return AddBalloonResponse(
-            success=True,
-            dimension=new_dimension
-        )
-    except Exception as e:
-        return AddBalloonResponse(
-            success=False,
-            dimension=None
-        )
+@router.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "ok", "service": "autoballoon-api"}
