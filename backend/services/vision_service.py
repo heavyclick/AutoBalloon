@@ -2,8 +2,6 @@
 Vision Service
 Integrates with Gemini Vision API for semantic understanding of manufacturing drawings.
 Used to identify which text elements are dimensions vs. labels, notes, part numbers, etc.
-
-ENHANCED: Captures ALL dimension modifiers like (2x), C/C, REF, TYP
 """
 import base64
 import json
@@ -97,64 +95,49 @@ class VisionService:
         return self._parse_dimension_response(result)
     
     def _build_dimension_identification_prompt(self) -> str:
-        """Build the prompt for dimension identification - captures ALL modifiers"""
-        return """You are an expert manufacturing engineer analyzing a technical drawing. Extract ALL dimensions with their COMPLETE values including modifiers.
+        """Build the prompt for dimension identification"""
+        return """You are analyzing a manufacturing/engineering drawing. Your task is to identify ALL numeric dimensions shown on the drawing.
 
-## CRITICAL: Include these modifiers WITH the dimension value:
+WHAT TO EXTRACT (dimensions):
+- Linear dimensions (e.g., "12.50", "25.4", "100")
+- Diameters (e.g., "Ø25", "⌀12.5", "DIA 10")
+- Radii (e.g., "R5", "R2.5")
+- Angles (e.g., "45°", "90°")
+- Tolerances (e.g., "12.50 ±0.05", "25.0 +0.1/-0.05")
+- Thread callouts (e.g., "M8x1.25", "1/4-20")
+- Depth callouts (e.g., "↧10", "DEPTH 5")
+- Chamfers (e.g., "C1", "45° x 2")
 
-QUANTITY MULTIPLIERS:
-- "(2x)", "(4x)", "(6x)" - e.g., "Ø3.4 (2x)" NOT just "Ø3.4"
-- "TYP" or "TYPICAL" - e.g., "R5 TYP" NOT just "R5"
-
-SPACING NOTATIONS:
-- "C/C" (Center-to-Center) - e.g., "35 C/C" NOT just "35"
-- "B.C." or "PCD" (Bolt Circle)
-
-REFERENCE MARKERS:
-- "REF" - e.g., "0.95 REF" NOT just "0.95"
-- "NOM", "BSC", "MAX", "MIN"
-
-## CORRECT vs WRONG:
-
-✓ "35 C/C"       ✗ "35"
-✓ "Ø3.4 (2x)"    ✗ "Ø3.4"
-✓ "Ø7.5 (2x)"    ✗ "Ø7.5"
-✓ "0.95 REF"     ✗ "0.95"
-✓ "R5 TYP"       ✗ "R5"
-✓ "89.5°"        ✗ "89.5"
-✓ "2×.5 (2x)"    ✗ "2×.5"
-
-## WHAT TO EXTRACT:
-- Linear dimensions (e.g., "12.50", "35 C/C")
-- Diameters (e.g., "Ø25", "Ø3.4 (2x)")
-- Radii (e.g., "R5", "R2.5 TYP")
-- Angles (e.g., "45°", "89.5°")
-- Tolerances (e.g., "12.50 ±0.05")
-- Thread callouts (e.g., "M8×1.25")
-- Reference dimensions (e.g., "15.3 REF")
-
-## WHAT TO IGNORE:
-- Part numbers, revision letters, drawing numbers
+WHAT TO IGNORE (not dimensions):
+- Part numbers (e.g., "PN-12345", "PART NO.")
+- Revision letters (e.g., "REV A", "REV B")  
+- Drawing numbers
 - Scale indicators (e.g., "SCALE 2:1")
-- Title block text (PRODUCT, MATERIAL, SIZE, SHEET)
-- Company names and logos
-- Zone/grid references (A, B, C... 1, 2, 3...)
-- Section labels (e.g., "SECTION A-A")
-- Notes that are not measurements
+- Company names
+- Title block text
+- Notes and annotations that are not measurements
+- Zone/grid references (e.g., "A1", "B3", "ZONE C")
+- Material specifications
+- Surface finish symbols without dimensions
 
-## RULES:
-1. Extract EXACT text as shown INCLUDING all modifiers
-2. Include symbols (Ø, R, ±, °) that are part of the dimension
-3. Include quantity multipliers (2x) that appear near the dimension
-4. Include spacing notations (C/C) that appear with the dimension
-5. Do NOT split modifiers from their dimensions
+RULES:
+1. Extract the EXACT text as it appears on the drawing
+2. Include any symbols (Ø, R, ±, °) that are part of the dimension
+3. Include tolerance values if they are attached to the dimension
+4. Do NOT infer or calculate any values
+5. If you cannot clearly read a dimension, do not include it
 
-Return JSON:
+Return a JSON object with this exact structure:
 {
-    "dimensions": ["35 C/C", "Ø3.4 (2x)", "Ø7.5 (2x)", "89.5°", "0.95 REF"]
+    "dimensions": ["12.50", "Ø25.00 ±0.05", "R5", "45°", "M8x1.25"]
 }
 
-Return ONLY the JSON object."""
+If no dimensions are found, return:
+{
+    "dimensions": []
+}
+
+Return ONLY the JSON object, no other text."""
     
     def _parse_dimension_response(self, response: dict) -> list[str]:
         """Parse Gemini's response and extract dimension values"""
@@ -206,7 +189,15 @@ Return ONLY the JSON object."""
         Use Gemini Vision to detect the grid reference system on the drawing.
         
         Returns:
-            Grid info dict or None if no grid detected
+            Grid info dict or None if no grid detected:
+            {
+                "columns": ["A", "B", "C", "D", "E", "F", "G", "H"],
+                "rows": ["1", "2", "3", "4"],
+                "boundaries": {
+                    "column_edges": [0, 125, 250, ...],  # Normalized x positions
+                    "row_edges": [0, 250, 500, ...]      # Normalized y positions
+                }
+            }
         """
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
         
