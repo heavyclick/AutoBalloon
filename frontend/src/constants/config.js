@@ -1,14 +1,18 @@
 /**
  * Application Configuration Constants
  * Updated for Glass Wall system
+ * Maintains backward compatibility with existing components
  */
 
 // API Configuration
 export const API_BASE_URL = import.meta.env.VITE_API_URL || 'https://autoballoon-production.up.railway.app';
 
-// Pricing
+// Pricing - New Glass Wall pricing
 export const PRICE_PASS_24H = 49;
 export const PRICE_PRO_MONTHLY = 99;
+
+// Legacy exports for backward compatibility (PricingCard.jsx uses these)
+export const PRICE_MONTHLY = 99;
 export const PRICE_FUTURE = 199;  // Future price for "locked in" messaging
 
 // Free tier (now just for preview, not export)
