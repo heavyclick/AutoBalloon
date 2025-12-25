@@ -1,9 +1,9 @@
 """
 Vision Service
 Integrates with Gemini Vision API for semantic understanding of manufacturing drawings.
+Used to identify which text elements are dimensions vs. labels, notes, part numbers, etc.
 
-MAJOR FIX: Now requests bounding boxes from Gemini so we know WHERE each dimension is,
-not just what it says. This prevents misplacement when the same number appears multiple times.
+ENHANCED: Captures ALL dimension modifiers like (2x), C/C, REF, TYP
 """
 import base64
 import json
@@ -26,7 +26,7 @@ class VisionServiceError(Exception):
 class VisionService:
     """
     Gemini Vision API integration for semantic analysis.
-    Identifies dimensions on manufacturing drawings WITH their locations.
+    Identifies dimensions on manufacturing drawings.
     """
     
     GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
@@ -38,29 +38,17 @@ class VisionService:
     
     async def identify_dimensions(self, image_bytes: bytes) -> list[str]:
         """
-        Legacy method - returns just dimension values.
-        Use identify_dimensions_with_locations() for accurate placement.
-        """
-        result = await self.identify_dimensions_with_locations(image_bytes)
-        return [d["value"] for d in result]
-    
-    async def identify_dimensions_with_locations(self, image_bytes: bytes) -> list[dict]:
-        """
-        Use Gemini Vision to identify dimensions WITH their approximate locations.
+        Use Gemini Vision to identify which text values are dimensions.
         
         Args:
             image_bytes: PNG image data
             
         Returns:
-            List of dicts with:
-            {
-                "value": "Ø7.5 (2x)",
-                "bbox": {"xmin": 0.4, "ymin": 0.3, "xmax": 0.5, "ymax": 0.35}  # normalized 0-1
-            }
+            List of dimension values (strings) that Gemini identified
         """
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
         
-        prompt = self._build_dimension_with_location_prompt()
+        prompt = self._build_dimension_identification_prompt()
         
         payload = {
             "contents": [{
@@ -75,14 +63,14 @@ class VisionService:
                 ]
             }],
             "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 8192,
+                "temperature": 0.1,  # Low temperature for consistency
+                "maxOutputTokens": 4096,
                 "responseMimeType": "application/json"
             }
         }
         
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with httpx.AsyncClient(timeout=90.0) as client:
                 response = await client.post(
                     f"{self.GEMINI_API_URL}?key={self.api_key}",
                     json=payload,
@@ -106,78 +94,72 @@ class VisionService:
                 f"Failed to call Gemini Vision API: {str(e)}"
             )
         
-        return self._parse_dimension_with_location_response(result)
+        return self._parse_dimension_response(result)
     
-    def _build_dimension_with_location_prompt(self) -> str:
-        """Build prompt that requests both dimension values AND their locations"""
-        return """You are an expert at reading technical/engineering drawings. Your task is to find ALL dimensions on this drawing and report their VALUES and LOCATIONS.
+    def _build_dimension_identification_prompt(self) -> str:
+        """Build the prompt for dimension identification - captures ALL modifiers"""
+        return """You are an expert manufacturing engineer analyzing a technical drawing. Extract ALL dimensions with their COMPLETE values including modifiers.
 
-## CRITICAL: You must provide the LOCATION of each dimension
+## CRITICAL: Include these modifiers WITH the dimension value:
 
-For each dimension you find, estimate its bounding box as normalized coordinates (0.0 to 1.0):
-- xmin: left edge of dimension text (0.0 = left edge of image, 1.0 = right edge)
-- ymin: top edge of dimension text (0.0 = top edge of image, 1.0 = bottom edge)
-- xmax: right edge of dimension text
-- ymax: bottom edge of dimension text
+QUANTITY MULTIPLIERS:
+- "(2x)", "(4x)", "(6x)" - e.g., "Ø3.4 (2x)" NOT just "Ø3.4"
+- "TYP" or "TYPICAL" - e.g., "R5 TYP" NOT just "R5"
 
-## WHAT TO EXTRACT (dimensions on the actual drawing):
-- Linear dimensions (e.g., "35", "50.5", "100")
-- Dimensions with modifiers (e.g., "35 C/C", "Ø3.4 (2x)", "7.5 (2x)", "R5 TYP")
-- Diameters (e.g., "Ø25", "⌀12.5")
-- Radii (e.g., "R5", "R2.5")
+SPACING NOTATIONS:
+- "C/C" (Center-to-Center) - e.g., "35 C/C" NOT just "35"
+- "B.C." or "PCD" (Bolt Circle)
+
+REFERENCE MARKERS:
+- "REF" - e.g., "0.95 REF" NOT just "0.95"
+- "NOM", "BSC", "MAX", "MIN"
+
+## CORRECT vs WRONG:
+
+✓ "35 C/C"       ✗ "35"
+✓ "Ø3.4 (2x)"    ✗ "Ø3.4"
+✓ "Ø7.5 (2x)"    ✗ "Ø7.5"
+✓ "0.95 REF"     ✗ "0.95"
+✓ "R5 TYP"       ✗ "R5"
+✓ "89.5°"        ✗ "89.5"
+✓ "2×.5 (2x)"    ✗ "2×.5"
+
+## WHAT TO EXTRACT:
+- Linear dimensions (e.g., "12.50", "35 C/C")
+- Diameters (e.g., "Ø25", "Ø3.4 (2x)")
+- Radii (e.g., "R5", "R2.5 TYP")
 - Angles (e.g., "45°", "89.5°")
 - Tolerances (e.g., "12.50 ±0.05")
 - Thread callouts (e.g., "M8×1.25")
-- Any numeric measurement with dimension lines or leaders
+- Reference dimensions (e.g., "15.3 REF")
 
-## IMPORTANT: Include ALL modifiers with the dimension:
-- "(2x)", "(4x)" quantity indicators
-- "C/C" (center-to-center)
-- "TYP" (typical)
-- "REF" (reference)
-- Tolerance values
-
-## WHAT TO IGNORE (NOT dimensions):
-- Title block text (PRODUCT, MATERIAL, SIZE, SHEET, SCALE, etc.)
-- Part numbers and revision letters
-- Notes section text
-- Grid reference letters and numbers at the borders (A, B, C... 1, 2, 3...)
+## WHAT TO IGNORE:
+- Part numbers, revision letters, drawing numbers
+- Scale indicators (e.g., "SCALE 2:1")
+- Title block text (PRODUCT, MATERIAL, SIZE, SHEET)
 - Company names and logos
-- "FIRST ANGLE PROJECTION" text
-- Section labels like "SECTION A-A"
-- Component/BOM table content
-
-## OUTPUT FORMAT:
-Return a JSON object with this exact structure:
-{
-    "dimensions": [
-        {
-            "value": "89.5°",
-            "bbox": {"xmin": 0.35, "ymin": 0.18, "xmax": 0.42, "ymax": 0.22}
-        },
-        {
-            "value": "Ø3.4 (2x)",
-            "bbox": {"xmin": 0.38, "ymin": 0.28, "xmax": 0.48, "ymax": 0.32}
-        },
-        {
-            "value": "35 C/C",
-            "bbox": {"xmin": 0.30, "ymin": 0.25, "xmax": 0.38, "ymax": 0.30}
-        }
-    ]
-}
+- Zone/grid references (A, B, C... 1, 2, 3...)
+- Section labels (e.g., "SECTION A-A")
+- Notes that are not measurements
 
 ## RULES:
-1. Extract EVERY dimension visible on the drawing (not in title block or notes)
-2. Include the COMPLETE dimension value with all modifiers
-3. Estimate the bounding box as accurately as possible
-4. If the same value appears multiple times, include EACH occurrence with its own location
-5. Do NOT include text from the title block, notes section, or border grid references
+1. Extract EXACT text as shown INCLUDING all modifiers
+2. Include symbols (Ø, R, ±, °) that are part of the dimension
+3. Include quantity multipliers (2x) that appear near the dimension
+4. Include spacing notations (C/C) that appear with the dimension
+5. Do NOT split modifiers from their dimensions
+
+Return JSON:
+{
+    "dimensions": ["35 C/C", "Ø3.4 (2x)", "Ø7.5 (2x)", "89.5°", "0.95 REF"]
+}
 
 Return ONLY the JSON object."""
     
-    def _parse_dimension_with_location_response(self, response: dict) -> list[dict]:
-        """Parse Gemini's response with locations"""
+    def _parse_dimension_response(self, response: dict) -> list[str]:
+        """Parse Gemini's response and extract dimension values"""
         try:
+            # Navigate Gemini response structure
             candidates = response.get("candidates", [])
             if not candidates:
                 return []
@@ -189,61 +171,22 @@ Return ONLY the JSON object."""
             
             text = parts[0].get("text", "")
             
-            # Handle markdown code blocks
+            # Parse JSON from response
+            # Handle potential markdown code blocks
             text = text.strip()
             if text.startswith("```"):
+                # Remove markdown code block
                 lines = text.split("\n")
                 text = "\n".join(lines[1:-1])
             
             data = json.loads(text)
             dimensions = data.get("dimensions", [])
             
-            # Validate and normalize
+            # Validate and clean
             clean_dimensions = []
             for dim in dimensions:
-                if not isinstance(dim, dict):
-                    continue
-                
-                value = dim.get("value", "")
-                bbox = dim.get("bbox", {})
-                
-                if not value or not isinstance(value, str):
-                    continue
-                
-                # Normalize the value
-                value = self._normalize_dimension_value(value.strip())
-                
-                # Validate and normalize bbox
-                try:
-                    xmin = float(bbox.get("xmin", 0))
-                    ymin = float(bbox.get("ymin", 0))
-                    xmax = float(bbox.get("xmax", 0))
-                    ymax = float(bbox.get("ymax", 0))
-                    
-                    # Clamp to valid range
-                    xmin = max(0, min(1, xmin))
-                    ymin = max(0, min(1, ymin))
-                    xmax = max(0, min(1, xmax))
-                    ymax = max(0, min(1, ymax))
-                    
-                    # Ensure max > min
-                    if xmax <= xmin:
-                        xmax = xmin + 0.05
-                    if ymax <= ymin:
-                        ymax = ymin + 0.03
-                    
-                    clean_dimensions.append({
-                        "value": value,
-                        "bbox": {
-                            "xmin": xmin,
-                            "ymin": ymin,
-                            "xmax": xmax,
-                            "ymax": ymax
-                        }
-                    })
-                except (ValueError, TypeError):
-                    # Skip dimensions with invalid bbox
-                    continue
+                if isinstance(dim, str) and dim.strip():
+                    clean_dimensions.append(dim.strip())
             
             return clean_dimensions
             
@@ -258,30 +201,13 @@ Return ONLY the JSON object."""
                 f"Failed to parse Gemini response structure: {str(e)}"
             )
     
-    def _normalize_dimension_value(self, value: str) -> str:
-        """Normalize dimension value formatting for consistency"""
-        # Standardize diameter symbols
-        value = re.sub(r'⌀|Φ|φ|DIA\s*', 'Ø', value)
-        
-        # Standardize multiplication symbol for threads
-        value = re.sub(r'(\d)\s*[xX]\s*(\d)', r'\1×\2', value)
-        
-        # Standardize plus/minus
-        value = re.sub(r'\+/-|±', '±', value)
-        
-        # Standardize quantity notation spacing
-        value = re.sub(r'\(\s*(\d+)\s*[xX]\s*\)', r'(\1x)', value)
-        
-        # Standardize C/C notation
-        value = re.sub(r'C-C|c-c|C\.C\.|c\.c\.', 'C/C', value)
-        
-        # Ensure degree symbol is attached
-        value = re.sub(r'(\d)\s*°', r'\1°', value)
-        
-        return value
-    
     async def detect_grid(self, image_bytes: bytes) -> Optional[dict]:
-        """Use Gemini Vision to detect the grid reference system on the drawing."""
+        """
+        Use Gemini Vision to detect the grid reference system on the drawing.
+        
+        Returns:
+            Grid info dict or None if no grid detected
+        """
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
         
         prompt = self._build_grid_detection_prompt()
@@ -315,6 +241,7 @@ Return ONLY the JSON object."""
                 response.raise_for_status()
                 result = response.json()
         except Exception:
+            # Grid detection is optional - return None on any error
             return None
         
         return self._parse_grid_response(result)
@@ -327,6 +254,8 @@ Look for:
 1. Column letters (typically A-H or A-J) along the top or bottom edge
 2. Row numbers (typically 1-4 or 1-6) along the left or right edge
 3. Grid lines dividing the drawing into zones
+
+If a grid system is present, estimate the boundaries of each zone.
 
 Return a JSON object:
 {
@@ -372,6 +301,7 @@ Return ONLY the JSON object."""
             if not columns or not rows:
                 return None
             
+            # Calculate evenly-distributed boundaries
             col_count = len(columns)
             row_count = len(rows)
             
@@ -397,6 +327,7 @@ Return ONLY the JSON object."""
             return None
 
 
+# Factory function
 def create_vision_service(api_key: Optional[str] = None) -> VisionService:
     """Create vision service instance"""
     return VisionService(api_key=api_key)
