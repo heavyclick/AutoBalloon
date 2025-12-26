@@ -62,15 +62,27 @@ app.include_router(payment_router_v2, prefix="/api")
 # =============================================================================
 
 VALID_PROMO_CODES = {
-    "LINKEDIN24": {"hours": 24, "type": "linkedin_promo"},
-    "INFLUENCER": {"hours": 24, "type": "influencer"},
-    "TWITTER24": {"hours": 24, "type": "twitter_promo"},
-    "LAUNCH50": {"hours": 48, "type": "launch_promo"},
-    # Lifetime access codes for micro-influencers
-    "CREATOR2025": {"hours": None, "type": "lifetime_influencer"},  # None = never expires
-    "IGPARTNER": {"hours": None, "type": "lifetime_influencer"},
-    "YTPARTNER": {"hours": None, "type": "lifetime_influencer"},
+    "LINKEDIN24": {"hours": 24, "type": "linkedin_promo", "max_redemptions": 1000, "daily_cap": 20},
+    "INFLUENCER": {"hours": 24, "type": "influencer", "max_redemptions": 500, "daily_cap": 30},
+    "TWITTER24": {"hours": 24, "type": "twitter_promo", "max_redemptions": 1000, "daily_cap": 20},
+    "LAUNCH50": {"hours": 48, "type": "launch_promo", "max_redemptions": 200, "daily_cap": 50},
+    # Lifetime access codes for micro-influencers (limited quantity)
+    "CREATOR2025": {"hours": None, "type": "lifetime_influencer", "max_redemptions": 50, "daily_cap": 75, "monthly_cap": 300},
+    "IGPARTNER": {"hours": None, "type": "lifetime_influencer", "max_redemptions": 25, "daily_cap": 75, "monthly_cap": 300},
+    "YTPARTNER": {"hours": None, "type": "lifetime_influencer", "max_redemptions": 25, "daily_cap": 75, "monthly_cap": 300},
     # Add more codes here as needed
+}
+
+# Usage caps by plan type
+USAGE_CAPS = {
+    "linkedin_promo": {"daily": 20, "monthly": None},
+    "twitter_promo": {"daily": 20, "monthly": None},
+    "influencer": {"daily": 30, "monthly": None},
+    "launch_promo": {"daily": 50, "monthly": None},
+    "lifetime_influencer": {"daily": 75, "monthly": 300},
+    "pass_24h": {"daily": 50, "monthly": None},
+    "pro_monthly": {"daily": 100, "monthly": 500},
+    "free": {"daily": 3, "monthly": 5},  # Free tier
 }
 
 
@@ -218,34 +230,42 @@ async def redeem_promo(request: Request):
         
         print(f"Promo redeem attempt: email={email}, code={code}")
         
-        # Validate
+        # Validate email
         if not email or "@" not in email:
             return JSONResponse({"success": False, "message": "Invalid email"}, status_code=400)
         
+        # Check if promo code exists
         if code not in VALID_PROMO_CODES:
             return JSONResponse({"success": False, "message": "Invalid promo code"}, status_code=400)
         
         promo = VALID_PROMO_CODES[code]
         
+        # Check if this email already used this promo type (prevent re-use)
+        existing_for_email = db.table("access_passes").select("id").eq("email", email).eq("pass_type", promo["type"]).execute()
+        if existing_for_email.data and len(existing_for_email.data) > 0:
+            return JSONResponse({
+                "success": False, 
+                "message": "You've already used this type of promo code"
+            }, status_code=400)
+        
+        # Check if promo code has reached max redemptions
+        if "max_redemptions" in promo:
+            total_redemptions = db.table("access_passes").select("id", count="exact").eq("granted_by", f"promo_{code}").execute()
+            if total_redemptions.count >= promo["max_redemptions"]:
+                return JSONResponse({
+                    "success": False, 
+                    "message": "This promo code has reached its limit. Try another code or upgrade to Pro!"
+                }, status_code=400)
+        
         # Handle lifetime vs timed access
         if promo["hours"] is None:
-            # Lifetime access - no expiry
             expires_at = None
             hours_display = "lifetime"
         else:
             expires_at = (datetime.utcnow() + timedelta(hours=promo["hours"])).isoformat()
             hours_display = promo["hours"]
         
-        # Check if already redeemed using Supabase client
-        existing = db.table("access_passes").select("id").eq("email", email).eq("pass_type", promo["type"]).execute()
-        
-        if existing.data and len(existing.data) > 0:
-            return JSONResponse({
-                "success": False, 
-                "message": "You've already used this promo code"
-            }, status_code=400)
-        
-        # Grant access using Supabase client
+        # Grant access
         insert_data = {
             "email": email,
             "pass_type": promo["type"],
@@ -276,7 +296,8 @@ async def redeem_promo(request: Request):
             "message": message,
             "expires_at": expires_at,
             "hours": promo["hours"],
-            "is_lifetime": promo["hours"] is None
+            "is_lifetime": promo["hours"] is None,
+            "daily_cap": promo.get("daily_cap", USAGE_CAPS.get(promo["type"], {}).get("daily", 50))
         }
         
     except Exception as e:
@@ -310,10 +331,15 @@ async def check_access(email: str = ""):
                 if expires < datetime.now(expires.tzinfo):
                     return {"has_access": False, "reason": "expired"}
             
+            # Get usage caps for this plan type
+            caps = USAGE_CAPS.get(row["pass_type"], {"daily": 50, "monthly": 500})
+            
             return {
                 "has_access": True,
                 "access_type": row["pass_type"],
                 "expires_at": row["expires_at"],
+                "daily_cap": caps.get("daily"),
+                "monthly_cap": caps.get("monthly")
             }
         
         return {"has_access": False}
@@ -321,6 +347,147 @@ async def check_access(email: str = ""):
     except Exception as e:
         print(f"Access check error: {type(e).__name__}: {e}")
         return {"has_access": False, "error": str(e)}
+
+
+@app.post("/api/usage/track")
+async def track_usage(request: Request):
+    """
+    Track when a user processes a drawing.
+    Called after successful processing.
+    """
+    try:
+        db = get_supabase_client()
+        data = await request.json()
+        email = data.get("email", "").lower().strip()
+        
+        if not email:
+            return {"success": False, "message": "Email required"}
+        
+        # Get user's access pass
+        access = db.table("access_passes").select("id, pass_type").eq("email", email).eq("is_active", True).order("created_at", desc=True).limit(1).execute()
+        
+        if not access.data:
+            return {"success": False, "message": "No active access"}
+        
+        pass_type = access.data[0]["pass_type"]
+        access_id = access.data[0]["id"]
+        
+        # Record the usage
+        db.table("usage_logs").insert({
+            "email": email,
+            "access_pass_id": str(access_id),
+            "action": "process_drawing",
+            "created_at": datetime.utcnow().isoformat()
+        }).execute()
+        
+        return {"success": True}
+        
+    except Exception as e:
+        print(f"Usage track error: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/usage/status")
+async def get_usage_status(email: str = ""):
+    """
+    Get current usage status for a user.
+    Returns daily/monthly counts and remaining allowance.
+    """
+    if not email:
+        return {"error": "Email required"}
+    
+    try:
+        db = get_supabase_client()
+        email = email.lower().strip()
+        
+        # Get user's access pass
+        access = db.table("access_passes").select("pass_type, expires_at").eq("email", email).eq("is_active", True).order("created_at", desc=True).limit(1).execute()
+        
+        if not access.data:
+            return {
+                "has_access": False,
+                "daily_used": 0,
+                "monthly_used": 0,
+                "daily_cap": USAGE_CAPS["free"]["daily"],
+                "monthly_cap": USAGE_CAPS["free"]["monthly"]
+            }
+        
+        pass_type = access.data[0]["pass_type"]
+        caps = USAGE_CAPS.get(pass_type, {"daily": 50, "monthly": 500})
+        
+        # Count today's usage
+        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        daily_usage = db.table("usage_logs").select("id", count="exact").eq("email", email).gte("created_at", today_start).execute()
+        
+        # Count this month's usage
+        month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+        monthly_usage = db.table("usage_logs").select("id", count="exact").eq("email", email).gte("created_at", month_start).execute()
+        
+        daily_used = daily_usage.count or 0
+        monthly_used = monthly_usage.count or 0
+        
+        daily_cap = caps.get("daily") or 999
+        monthly_cap = caps.get("monthly") or 9999
+        
+        # Check if user has exceeded limits
+        exceeded = False
+        exceeded_reason = None
+        
+        if daily_used >= daily_cap:
+            exceeded = True
+            exceeded_reason = f"Daily limit reached ({daily_cap} drawings). Resets at midnight UTC."
+        elif monthly_cap and monthly_used >= monthly_cap:
+            exceeded = True
+            exceeded_reason = f"Monthly limit reached ({monthly_cap} drawings). Resets on the 1st."
+        
+        return {
+            "has_access": True,
+            "pass_type": pass_type,
+            "daily_used": daily_used,
+            "daily_cap": daily_cap,
+            "daily_remaining": max(0, daily_cap - daily_used),
+            "monthly_used": monthly_used,
+            "monthly_cap": monthly_cap,
+            "monthly_remaining": max(0, monthly_cap - monthly_used) if monthly_cap else None,
+            "exceeded": exceeded,
+            "exceeded_reason": exceeded_reason
+        }
+        
+    except Exception as e:
+        print(f"Usage status error: {e}")
+        return {"error": str(e)}
+
+
+@app.get("/api/usage/can-process")
+async def can_process(email: str = ""):
+    """
+    Quick check if user can process another drawing.
+    Returns simple yes/no with reason.
+    """
+    if not email:
+        return {"can_process": False, "reason": "Not logged in"}
+    
+    try:
+        status = await get_usage_status(email)
+        
+        if status.get("error"):
+            return {"can_process": False, "reason": status["error"]}
+        
+        if not status.get("has_access"):
+            return {"can_process": False, "reason": "No active access. Use a promo code or upgrade to Pro."}
+        
+        if status.get("exceeded"):
+            return {"can_process": False, "reason": status["exceeded_reason"]}
+        
+        return {
+            "can_process": True,
+            "daily_remaining": status["daily_remaining"],
+            "monthly_remaining": status.get("monthly_remaining")
+        }
+        
+    except Exception as e:
+        print(f"Can process check error: {e}")
+        return {"can_process": False, "reason": "Error checking usage"}
 
 
 # =============================================================================
