@@ -5,10 +5,13 @@ import { API_BASE_URL, MAX_FILE_SIZE_MB, ALLOWED_EXTENSIONS } from '../constants
 import { GlassWallPaywall } from './GlassWallPaywall';
 import { PreviewWatermark } from './PreviewWatermark';
 
-export function DropZone({ onBeforeProcess }) {
+export function DropZone({ onBeforeProcess, hasPromoAccess = false, userEmail = '' }) {
   const { token, isPro } = useAuth();
   const { visitorId, incrementUsage, usage, refreshUsage } = useUsage();
   const fileInputRef = useRef(null);
+  
+  // User has access if: isPro OR hasPromoAccess (from URL promo code)
+  const canDownload = isPro || hasPromoAccess;
   
   const [isDragging, setIsDragging] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -122,7 +125,7 @@ export function DropZone({ onBeforeProcess }) {
         result={result} 
         onReset={handleReset} 
         token={token}
-        isPro={isPro}
+        isPro={canDownload}
         onShowGlassWall={() => setShowGlassWall(true)}
         currentPage={currentPage} 
         setCurrentPage={setCurrentPage} 
