@@ -74,6 +74,70 @@ VALID_PROMO_CODES = {
 # PROMO ROUTES
 # =============================================================================
 
+def get_supabase_client():
+    """Get Supabase client - inline to avoid import issues"""
+    from supabase import create_client
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
+    if not url or not key:
+        raise ValueError("Supabase credentials not configured")
+    return create_client(url, key)
+
+
+def send_welcome_email(email: str, hours: int):
+    """Send welcome email via Resend"""
+    import resend
+    
+    resend.api_key = os.getenv("RESEND_API_KEY")
+    if not resend.api_key:
+        print("WARNING: RESEND_API_KEY not set, skipping email")
+        return False
+    
+    try:
+        resend.Emails.send({
+            "from": "AutoBalloon <hello@autoballoon.space>",
+            "to": email,
+            "subject": f"🎉 Your {hours}-Hour Free Access is Active!",
+            "html": f"""
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+                <h1 style="color: #E63946;">Welcome to AutoBalloon! 🎈</h1>
+                
+                <p>Great news! Your <strong>{hours}-hour free access</strong> is now active.</p>
+                
+                <p>You can now:</p>
+                <ul>
+                    <li>✅ Upload unlimited blueprints</li>
+                    <li>✅ Download ballooned PDFs</li>
+                    <li>✅ Export AS9102 Form 3 Excel reports</li>
+                </ul>
+                
+                <div style="background: #f5f5f5; padding: 20px; border-radius: 10px; margin: 20px 0; text-align: center;">
+                    <p style="margin: 0 0 10px 0; color: #666;">Ready to start?</p>
+                    <a href="https://autoballoon.space" 
+                       style="display: inline-block; background: #E63946; color: white; padding: 12px 30px; text-decoration: none; border-radius: 5px; font-weight: bold;">
+                        Open AutoBalloon →
+                    </a>
+                </div>
+                
+                <p style="color: #666; font-size: 14px;">
+                    Your access expires in {hours} hours. After that, you can upgrade to Pro for unlimited access.
+                </p>
+                
+                <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
+                
+                <p style="color: #999; font-size: 12px;">
+                    Questions? Reply to this email or reach out at hello@autoballoon.space
+                </p>
+            </div>
+            """
+        })
+        print(f"Welcome email sent to {email}")
+        return True
+    except Exception as e:
+        print(f"Failed to send email: {e}")
+        return False
+
+
 @app.post("/api/promo/redeem")
 async def redeem_promo(request: Request):
     """
@@ -81,8 +145,7 @@ async def redeem_promo(request: Request):
     Backend grants 24h access and returns success
     """
     try:
-        from database_service import get_db
-        db = get_db()
+        db = get_supabase_client()
         
         data = await request.json()
         email = data.get("email", "").lower().strip()
@@ -120,6 +183,9 @@ async def redeem_promo(request: Request):
         
         print(f"Promo redeemed successfully for {email}: {result}")
         
+        # Send welcome email
+        send_welcome_email(email, promo["hours"])
+        
         return {
             "success": True,
             "message": f"Success! You have {promo['hours']} hours of free access.",
@@ -144,9 +210,7 @@ async def check_access(email: str = ""):
         return {"has_access": False}
     
     try:
-        from database_service import get_db
-        db = get_db()
-        
+        db = get_supabase_client()
         email = email.lower().strip()
         
         # Query using Supabase client
