@@ -66,6 +66,10 @@ VALID_PROMO_CODES = {
     "INFLUENCER": {"hours": 24, "type": "influencer"},
     "TWITTER24": {"hours": 24, "type": "twitter_promo"},
     "LAUNCH50": {"hours": 48, "type": "launch_promo"},
+    # Lifetime access codes for micro-influencers
+    "CREATOR2025": {"hours": None, "type": "lifetime_influencer"},  # None = never expires
+    "IGPARTNER": {"hours": None, "type": "lifetime_influencer"},
+    "YTPARTNER": {"hours": None, "type": "lifetime_influencer"},
     # Add more codes here as needed
 }
 
@@ -138,6 +142,67 @@ def send_welcome_email(email: str, hours: int):
         return False
 
 
+def send_lifetime_welcome_email(email: str):
+    """Send lifetime access welcome email via Resend"""
+    import resend
+    
+    resend.api_key = os.getenv("RESEND_API_KEY")
+    if not resend.api_key:
+        print("WARNING: RESEND_API_KEY not set, skipping email")
+        return False
+    
+    try:
+        resend.Emails.send({
+            "from": "AutoBalloon <hello@autoballoon.space>",
+            "to": email,
+            "subject": "🎉 Welcome to AutoBalloon Pro - Lifetime Access!",
+            "html": """
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+                <h1 style="color: #E63946;">Welcome to the AutoBalloon Family! 🎈</h1>
+                
+                <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 20px; border-radius: 10px; margin: 20px 0; text-align: center;">
+                    <p style="color: white; font-size: 24px; font-weight: bold; margin: 0;">
+                        ✨ LIFETIME PRO ACCESS ✨
+                    </p>
+                </div>
+                
+                <p>Thank you for being an amazing creator! As a valued partner, you now have <strong>lifetime Pro access</strong> to AutoBalloon.</p>
+                
+                <p>Your Pro benefits include:</p>
+                <ul>
+                    <li>✅ Unlimited blueprint processing forever</li>
+                    <li>✅ AS9102 Form 3 Excel exports</li>
+                    <li>✅ Priority processing</li>
+                    <li>✅ All future features included</li>
+                </ul>
+                
+                <div style="background: #f5f5f5; padding: 20px; border-radius: 10px; margin: 20px 0; text-align: center;">
+                    <p style="margin: 0 0 10px 0; color: #666;">Ready to start?</p>
+                    <a href="https://autoballoon.space" 
+                       style="display: inline-block; background: #E63946; color: white; padding: 12px 30px; text-decoration: none; border-radius: 5px; font-weight: bold;">
+                        Open AutoBalloon →
+                    </a>
+                </div>
+                
+                <p style="color: #666; font-size: 14px;">
+                    We'd love to see your content! Tag us when you share and we'll reshare your posts. 🙌
+                </p>
+                
+                <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
+                
+                <p style="color: #999; font-size: 12px;">
+                    Questions? Reply to this email - we're always here to help!
+                </p>
+            </div>
+            """
+        })
+        print(f"Lifetime welcome email sent to {email}")
+        return True
+    except Exception as e:
+        print(f"Failed to send lifetime email: {e}")
+        return False
+
+
 @app.post("/api/promo/redeem")
 async def redeem_promo(request: Request):
     """
@@ -161,7 +226,15 @@ async def redeem_promo(request: Request):
             return JSONResponse({"success": False, "message": "Invalid promo code"}, status_code=400)
         
         promo = VALID_PROMO_CODES[code]
-        expires_at = (datetime.utcnow() + timedelta(hours=promo["hours"])).isoformat()
+        
+        # Handle lifetime vs timed access
+        if promo["hours"] is None:
+            # Lifetime access - no expiry
+            expires_at = None
+            hours_display = "lifetime"
+        else:
+            expires_at = (datetime.utcnow() + timedelta(hours=promo["hours"])).isoformat()
+            hours_display = promo["hours"]
         
         # Check if already redeemed using Supabase client
         existing = db.table("access_passes").select("id").eq("email", email).eq("pass_type", promo["type"]).execute()
@@ -173,24 +246,37 @@ async def redeem_promo(request: Request):
             }, status_code=400)
         
         # Grant access using Supabase client
-        result = db.table("access_passes").insert({
+        insert_data = {
             "email": email,
             "pass_type": promo["type"],
             "granted_by": f"promo_{code}",
-            "expires_at": expires_at,
             "is_active": True
-        }).execute()
+        }
+        if expires_at:
+            insert_data["expires_at"] = expires_at
+        
+        result = db.table("access_passes").insert(insert_data).execute()
         
         print(f"Promo redeemed successfully for {email}: {result}")
         
         # Send welcome email
-        send_welcome_email(email, promo["hours"])
+        if promo["hours"] is None:
+            send_lifetime_welcome_email(email)
+        else:
+            send_welcome_email(email, promo["hours"])
+        
+        # Determine message based on access type
+        if promo["hours"] is None:
+            message = "Success! You now have lifetime Pro access."
+        else:
+            message = f"Success! You have {promo['hours']} hours of free access."
         
         return {
             "success": True,
-            "message": f"Success! You have {promo['hours']} hours of free access.",
+            "message": message,
             "expires_at": expires_at,
-            "hours": promo["hours"]
+            "hours": promo["hours"],
+            "is_lifetime": promo["hours"] is None
         }
         
     except Exception as e:
