@@ -1,35 +1,20 @@
 /**
  * LandingPage Component
- * "The Mullet" - Party on top (the tool), Business on bottom (marketing)
+ * Updated for Glass Wall system - NO upload blocking
+ * Users can always upload and process; paywall shows at export
  */
 
-import React, { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import React from 'react';
 import { useAuth } from '../context/AuthContext';
-import { useUsage } from '../hooks/useUsage';
 import { Navbar } from '../components/Navbar';
 import { HowItWorks } from '../components/HowItWorks';
 import { PricingCard } from '../components/PricingCard';
 import { FAQ } from '../components/FAQ';
 import { Footer } from '../components/Footer';
-import { PaywallModal } from '../components/PaywallModal';
 import { DropZone } from '../components/DropZone';
-import { FREE_TIER_LIMIT } from '../constants/config';
 
 export function LandingPage() {
-  const navigate = useNavigate();
   const { isPro } = useAuth();
-  const { usage, shouldShowPaywall } = useUsage();
-  const [showPaywall, setShowPaywall] = useState(false);
-
-  // Called before processing starts
-  const handleBeforeProcess = () => {
-    if (shouldShowPaywall()) {
-      setShowPaywall(true);
-      return false; // Prevent processing
-    }
-    return true; // Allow processing
-  };
 
   return (
     <div className="min-h-screen bg-[#0d0d0d] text-white">
@@ -58,23 +43,7 @@ export function LandingPage() {
             AI-powered dimension detection for First Article Inspection.
           </p>
 
-          {/* Usage indicator for free users */}
-          {!isPro && (
-            <div className="inline-flex items-center gap-2 text-sm text-gray-500 mb-8">
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-              </svg>
-              {usage.remaining > 0 ? (
-                <span>
-                  {usage.remaining} free {usage.remaining === 1 ? 'drawing' : 'drawings'} remaining this month
-                </span>
-              ) : (
-                <span className="text-amber-500">Free limit reached</span>
-              )}
-            </div>
-          )}
-
-          {/* Pro indicator */}
+          {/* Pro indicator - only show for pro users */}
           {isPro && (
             <div className="inline-flex items-center gap-2 text-sm mb-8">
               <span className="bg-gradient-to-r from-amber-500 to-orange-500 text-black font-bold px-2 py-0.5 rounded text-xs">
@@ -90,12 +59,13 @@ export function LandingPage() {
       <section className="px-4 pb-16">
         <div className="max-w-5xl mx-auto">
           <div className="bg-[#161616] border border-[#2a2a2a] rounded-2xl p-6 md:p-8">
-            <DropZone onBeforeProcess={handleBeforeProcess} />
+            {/* No onBeforeProcess - Glass Wall doesn't block uploads */}
+            <DropZone />
             
-            {/* No signup required text */}
+            {/* Encouragement text for non-pro users */}
             {!isPro && (
               <p className="text-center text-gray-500 text-sm mt-6">
-                No credit card required • {FREE_TIER_LIMIT} free drawings/month
+                Try it free • No signup required • Pay only when you export
               </p>
             )}
           </div>
@@ -202,7 +172,7 @@ export function LandingPage() {
               },
               {
                 title: 'Secure Processing',
-                description: 'Enterprise-grade encryption. Files auto-delete after 24h (free) or stored securely (Pro).',
+                description: 'Enterprise-grade encryption. Files processed securely and never stored without permission.',
                 icon: '🔒',
               },
             ].map((item, i) => (
@@ -235,14 +205,7 @@ export function LandingPage() {
       {/* Footer */}
       <Footer />
 
-      {/* Paywall Modal */}
-      <PaywallModal 
-        isOpen={showPaywall} 
-        onLoginClick={() => {
-          setShowPaywall(false);
-          navigate('/login');
-        }}
-      />
+      {/* NOTE: Glass Wall paywall is handled INSIDE DropZone now, not here */}
     </div>
   );
 }
