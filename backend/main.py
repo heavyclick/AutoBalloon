@@ -7,6 +7,8 @@ SECURITY ARCHITECTURE:
 - NO database storage of drawing data
 - History stored in browser localStorage only
 - Compliant with ITAR, EAR, NIST 800-171, ISO 27001, GDPR
+
+DEBUG: Added /api/debug endpoint to view last processing results
 """
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,7 +28,7 @@ app = FastAPI(
 # CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for now
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -39,7 +41,6 @@ from api.payment_routes import router as payment_router
 from api.usage_routes import router as usage_router
 from api.download_routes import router as download_router
 
-# Include routers - NOTE: No history_routes or guest_session_routes (Zero Storage)
 app.include_router(main_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 app.include_router(payment_router, prefix="/api")
@@ -48,7 +49,44 @@ app.include_router(download_router)
 
 
 # =============================================================================
-# PROMO CODES (For marketing campaigns - grants temporary access)
+# DEBUG ENDPOINT - View last processing results for troubleshooting
+# =============================================================================
+
+@app.get("/api/debug")
+async def get_debug_log():
+    """
+    Return the last N processing results for debugging.
+    Shows raw OCR tokens, grouped OCR, and Gemini responses.
+    """
+    try:
+        from services.detection_service import get_debug_log
+        log = get_debug_log()
+        return {
+            "success": True,
+            "entry_count": len(log),
+            "entries": log
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "Debug logging may not be enabled in detection_service.py"
+        }
+
+
+@app.delete("/api/debug")
+async def clear_debug_log():
+    """Clear the debug log."""
+    try:
+        from services.detection_service import DEBUG_LOG
+        DEBUG_LOG.clear()
+        return {"success": True, "message": "Debug log cleared"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# =============================================================================
+# PROMO CODES
 # =============================================================================
 
 VALID_PROMO_CODES = {
@@ -135,10 +173,7 @@ def send_welcome_email(email: str, hours: int):
 
 @app.post("/api/promo/redeem")
 async def redeem_promo(request: Request):
-    """
-    Redeem a promo code for temporary free access.
-    NOTE: Only stores access pass info (email + expiry), NOT drawing data.
-    """
+    """Redeem a promo code for temporary free access."""
     try:
         db = get_supabase_client()
         
@@ -154,7 +189,6 @@ async def redeem_promo(request: Request):
         
         promo = VALID_PROMO_CODES[code]
         
-        # Check if already used this promo type
         existing = db.table("access_passes").select("id").eq("email", email).eq("pass_type", promo["type"]).execute()
         if existing.data and len(existing.data) > 0:
             return JSONResponse({
@@ -162,7 +196,6 @@ async def redeem_promo(request: Request):
                 "message": "You've already used this type of promo code"
             }, status_code=400)
         
-        # Grant access
         expires_at = None if promo["hours"] is None else (datetime.utcnow() + timedelta(hours=promo["hours"])).isoformat()
         
         insert_data = {
@@ -176,7 +209,6 @@ async def redeem_promo(request: Request):
         
         db.table("access_passes").insert(insert_data).execute()
         
-        # Send welcome email
         if promo["hours"]:
             send_welcome_email(email, promo["hours"])
         
@@ -232,15 +264,9 @@ async def check_access(email: str = ""):
         return {"has_access": False, "error": str(e)}
 
 
-# =============================================================================
-# SECURITY INFO ENDPOINT
-# =============================================================================
-
 @app.get("/api/security")
 async def security_info():
-    """
-    Return security architecture info for compliance documentation.
-    """
+    """Return security architecture info for compliance documentation."""
     return {
         "architecture": "ZERO_STORAGE",
         "description": "Files are processed entirely in memory and immediately discarded",
@@ -265,10 +291,6 @@ async def security_info():
     }
 
 
-# =============================================================================
-# STANDARD ROUTES
-# =============================================================================
-
 @app.get("/")
 async def root():
     return {
@@ -276,6 +298,7 @@ async def root():
         "version": APP_VERSION,
         "status": "running",
         "security": "ZERO_STORAGE",
+        "debug_endpoint": "/api/debug",
         "docs": "/docs"
     }
 
@@ -296,6 +319,7 @@ async def api_root():
             "/api/process",
             "/api/export",
             "/api/security",
+            "/api/debug",
             "/download/pdf",
             "/download/zip", 
             "/download/image",
