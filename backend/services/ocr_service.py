@@ -1,11 +1,16 @@
 """
-OCR Service
+OCR Service - Enhanced Version
 Integrates with Google Cloud Vision API for precise text detection with bounding boxes.
+
+IMPROVEMENTS:
+- Enhanced grouping for compound dimensions
+- Better tolerance value detection
+- Improved handling of small text close together
 """
 import base64
-import json
+import re
 import httpx
-from typing import Optional
+from typing import Optional, List
 from dataclasses import dataclass
 
 from config import GOOGLE_CLOUD_API_KEY, NORMALIZED_COORD_SYSTEM
@@ -43,6 +48,20 @@ class OCRService:
     
     VISION_API_URL = "https://vision.googleapis.com/v1/images:annotate"
     
+    # Pattern to detect dimension-like text
+    DIMENSION_LIKE_PATTERN = re.compile(
+        r'''(?:
+            [Øø⌀]\s*[\d.]+|           # Diameter
+            R\s*[\d.]+|               # Radius
+            \d+\s*/\s*\d+|            # Fractions
+            \d+\s+\d+\s*/\s*\d+|      # Mixed fractions
+            [\d.]+\s*(?:mm|in|"|')?|  # Decimals with units
+            [+-]\s*[\d.]+|            # Tolerances
+            [\d.]+\s*[°]              # Angles
+        )''',
+        re.VERBOSE | re.IGNORECASE
+    )
+    
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or GOOGLE_CLOUD_API_KEY
         if not self.api_key:
@@ -53,7 +72,7 @@ class OCRService:
         image_bytes: bytes, 
         image_width: int, 
         image_height: int
-    ) -> list[OCRDetection]:
+    ) -> List[OCRDetection]:
         """
         Detect all text in an image using Google Cloud Vision.
         
@@ -68,18 +87,27 @@ class OCRService:
         # Encode image to base64
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
         
-        # Build request payload
+        # Build request payload - use DOCUMENT_TEXT_DETECTION for better accuracy
         payload = {
             "requests": [{
                 "image": {
                     "content": image_b64
                 },
-                "features": [{
-                    "type": "TEXT_DETECTION",
-                    "maxResults": 500
-                }],
+                "features": [
+                    {
+                        "type": "TEXT_DETECTION",
+                        "maxResults": 500
+                    },
+                    {
+                        "type": "DOCUMENT_TEXT_DETECTION",  # Added for better OCR
+                        "maxResults": 1
+                    }
+                ],
                 "imageContext": {
-                    "languageHints": ["en"]
+                    "languageHints": ["en"],
+                    "textDetectionParams": {
+                        "enableTextDetectionConfidenceScore": True
+                    }
                 }
             }]
         }
@@ -119,7 +147,7 @@ class OCRService:
         response: dict, 
         image_width: int, 
         image_height: int
-    ) -> list[OCRDetection]:
+    ) -> List[OCRDetection]:
         """
         Parse Google Vision API response and normalize bounding boxes.
         
@@ -168,12 +196,14 @@ class OCRService:
                 for key in bounding_box:
                     bounding_box[key] = max(0, min(NORMALIZED_COORD_SYSTEM, bounding_box[key]))
                 
-                # Google Vision doesn't provide per-word confidence
+                # Google Vision doesn't always provide per-word confidence
                 # Use 0.95 as default (Google Vision is generally high accuracy)
+                confidence = annotation.get("confidence", 0.95)
+                
                 detections.append(OCRDetection(
                     text=text,
                     bounding_box=bounding_box,
-                    confidence=0.95
+                    confidence=confidence
                 ))
                 
         except (KeyError, IndexError, TypeError) as e:
@@ -186,16 +216,17 @@ class OCRService:
     
     def group_adjacent_text(
         self, 
-        detections: list[OCRDetection],
-        horizontal_threshold: int = 20,  # Normalized units (0-1000)
-        vertical_threshold: int = 10
-    ) -> list[OCRDetection]:
+        detections: List[OCRDetection],
+        horizontal_threshold: int = 25,  # Increased from 20 for compound dimensions
+        vertical_threshold: int = 12     # Slightly increased
+    ) -> List[OCRDetection]:
         """
         Group horizontally adjacent text detections into single entries.
         
-        Manufacturing dimensions often appear as separate words:
-        "12" "." "50" should become "12.50"
-        "Ø" "25" should become "Ø25"
+        ENHANCED for compound dimensions:
+        - 0.188" Wd. x 7/8" Lg. should stay together
+        - 0.2500in -0.0015 -0.0030 should stay together
+        - Small dimensions close together should stay separate
         
         Args:
             detections: List of individual text detections
@@ -226,11 +257,40 @@ class OCRService:
             # Check horizontal distance
             x_gap = detection.bounding_box["xmin"] - prev.bounding_box["xmax"]
             
+            # Determine if we should group
+            should_group = False
+            
             if y_diff <= vertical_threshold and 0 <= x_gap <= horizontal_threshold:
-                # Adjacent, add to current group
+                # Check if this looks like a continuation
+                # (tolerance value, modifier, or dimension component)
+                curr_text = detection.text.strip()
+                prev_text = prev.text.strip()
+                
+                # Group tolerance values with their base dimension
+                is_tolerance = bool(re.match(r'^[+-±]?\s*[\d.]+$', curr_text))
+                
+                # Group modifiers like "Wd.", "Lg.", "x", etc.
+                is_modifier = bool(re.match(
+                    r'^(?:x|X|×|Wd\.?|Lg\.?|Dia\.?|Rad\.?|THK\.?|TYP\.?|REF\.?|MAX\.?|MIN\.?)$', 
+                    curr_text, re.IGNORECASE
+                ))
+                
+                # Group if tolerance or modifier
+                if is_tolerance or is_modifier:
+                    should_group = True
+                # Group if gap is very small (likely same dimension)
+                elif x_gap <= 10:
+                    should_group = True
+                # Don't group if both look like separate dimensions
+                elif self._looks_like_dimension(prev_text) and self._looks_like_dimension(curr_text):
+                    should_group = False
+                else:
+                    should_group = True
+            
+            if should_group:
                 current_group.append(detection)
             else:
-                # Start new group
+                # Finish current group and start new one
                 grouped.append(self._merge_group(current_group))
                 current_group = [detection]
         
@@ -240,13 +300,37 @@ class OCRService:
         
         return grouped
     
-    def _merge_group(self, group: list[OCRDetection]) -> OCRDetection:
+    def _looks_like_dimension(self, text: str) -> bool:
+        """Check if text looks like a standalone dimension value."""
+        text = text.strip()
+        # Matches: 0.45, 3.5", Ø5, R2, 1/4, 3 3/4, etc.
+        return bool(re.match(
+            r'^(?:[Øø⌀R]?\s*)?[\d]+(?:[./]\d+)?(?:\s*\d+/\d+)?(?:\s*["\']|mm|in)?$',
+            text, re.IGNORECASE
+        ))
+    
+    def _merge_group(self, group: List[OCRDetection]) -> OCRDetection:
         """Merge a group of adjacent detections into one"""
         if len(group) == 1:
             return group[0]
         
-        # Concatenate text
-        merged_text = "".join(d.text for d in group)
+        # Concatenate text with appropriate spacing
+        texts = []
+        for i, d in enumerate(group):
+            if i > 0:
+                # Determine if space is needed
+                prev = group[i - 1]
+                gap = d.bounding_box["xmin"] - prev.bounding_box["xmax"]
+                
+                # Add space for larger gaps or between certain patterns
+                if gap > 10:
+                    texts.append(" ")
+                elif d.text.startswith(('x', 'X', '×')):
+                    texts.append(" ")  # Space before "x" separator
+            
+            texts.append(d.text)
+        
+        merged_text = "".join(texts)
         
         # Expand bounding box to encompass all
         merged_box = {
