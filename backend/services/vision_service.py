@@ -1,10 +1,8 @@
 """
-Vision Service
+Vision Service - Enhanced for AS9102/ISO 13485 compliance
 Integrates with Gemini Vision API for semantic understanding of manufacturing drawings.
-Used to identify which text elements are dimensions vs. labels, notes, part numbers, etc.
 
-ENHANCED: Prompt updated to capture ALL dimension modifiers AND thread specifications
-for AS9102/ISO 13485 compliance.
+CRITICAL FIX: Prompt now explicitly tells Gemini to NEVER split compound dimensions
 """
 import base64
 import json
@@ -40,12 +38,6 @@ class VisionService:
     async def identify_dimensions(self, image_bytes: bytes) -> list[str]:
         """
         Use Gemini Vision to identify which text values are dimensions.
-        
-        Args:
-            image_bytes: PNG image data
-            
-        Returns:
-            List of dimension values (strings) that Gemini identified
         """
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
         
@@ -64,7 +56,7 @@ class VisionService:
                 ]
             }],
             "generationConfig": {
-                "temperature": 0.1,  # Low temperature for consistency
+                "temperature": 0.1,
                 "maxOutputTokens": 4096,
                 "responseMimeType": "application/json"
             }
@@ -98,147 +90,93 @@ class VisionService:
         return self._parse_dimension_response(result)
     
     def _build_dimension_identification_prompt(self) -> str:
-        """
-        Build the prompt for dimension identification.
-        
-        ENHANCED for AS9102 First Article Inspection and ISO 13485 Medical Device compliance.
-        Captures ALL dimension modifiers AND thread specifications that are critical for inspection documentation.
-        """
-        return """You are an expert manufacturing engineer with 20+ years of experience reading technical drawings for AS9102 First Article Inspection (aerospace) and ISO 13485 (medical device) documentation.
+        """Build the prompt for dimension identification."""
+        return """You are an expert manufacturing engineer extracting dimensions from technical drawings for AS9102 First Article Inspection.
 
-Your task is to extract ALL dimensions AND thread specifications from this drawing with their COMPLETE values INCLUDING all modifiers.
+## YOUR TASK
+Extract ALL dimensions from this drawing. Return each dimension EXACTLY as it appears, including all modifiers and tolerances.
 
-## CRITICAL: THREAD SPECIFICATIONS (must be extracted!)
+## CRITICAL RULES - READ CAREFULLY
 
-### STANDARD INCH THREADS (UTS/Unified Thread Standard):
-- "6-32", "8-32", "10-24", "10-32", "1/4-20", "5/16-18", "3/8-16", "1/2-13"
-- With class: "1/4-20 UNC", "6-32 UNC-2B", "10-32 UNF"
-- With "Thread" suffix: "6-32 Thread", "8-32 THD"
-- Context phrases: "For 8-32", "For 6-32 Mounting Fastener", "Tap 1/4-20"
+### RULE 1: NEVER SPLIT COMPOUND DIMENSIONS
+These must be returned as ONE single entry:
+- "0.188" Wd. x 7/8" Lg. Key" → ONE entry (not split into "0.188" Wd." and "7/8" Lg.")
+- "0.2500in -0.0015 -0.0030" → ONE entry (dimension with tolerances)
+- "1.25in Usable Length Range Min." → ONE entry
+- "Usable Length Range Max.: 1 3/4"" → ONE entry
 
-### METRIC THREADS:
-- "M3x0.5", "M4x0.7", "M5x0.8", "M6x1.0", "M8x1.25", "M10x1.5"
-- With class: "M6x1.0 6H", "M8x1.25-6g"
+### RULE 2: KEEP MIXED FRACTIONS TOGETHER
+- "3 1/4"" → ONE entry (not "3" and "1/4"")
+- "4 7/8"" → ONE entry
+- "3 3/4"" → ONE entry
 
-### PIPE THREADS:
-- "1/4-18 NPT", "1/8-27 NPT", "3/8 NPTF", "1/2 BSPT"
+### RULE 3: INCLUDE TOLERANCE STACKS
+When you see a dimension followed by tolerance values on the same line:
+- "0.2500in -0.0015 -0.0030" → include ALL of it as ONE dimension
+- "15.3 +0.1/-0" → ONE entry
+- "25 ±0.5" → ONE entry
 
-## CRITICAL: Always include these modifiers as part of the dimension value
+### RULE 4: INCLUDE ALL MODIFIERS
+- Thread callouts: "6-32 Thread", "3/4"-16 UN/UNF (SAE)", "M8x1.25"
+- Quantity markers: "Ø3.4 (2x)", "R5 TYP", "6X 6-32"
+- Reference markers: "0.95 REF", "25 NOM", "45° BSC"
+- Limit markers: "15 MAX", "3 MIN"
+- Depth/through: "Ø6 THRU", "Ø5 ↧10"
 
-### QUANTITY/FEATURE COUNT (critical for inspection - indicates how many features to measure):
-- "(2x)", "(3x)", "(4x)", "(6x)", "(8x)" - e.g., "Ø3.4 (2x)" NOT "Ø3.4"
-- "2 PL", "3 PL", "4 PLACES", "6 HOLES" - e.g., "R2 4 PL" NOT "R2"
-- "TYP", "TYPICAL" - e.g., "R5 TYP" NOT "R5"
-- "EQ SP", "EQUALLY SPACED" - e.g., "30° EQ SP" NOT "30°"
+### RULE 5: SAME VALUE IN DIFFERENT LOCATIONS = SEPARATE ENTRIES
+If "16mm" appears twice in different parts of the drawing, return it TWICE:
+["16mm", "16mm"]
 
-### SPACING/PATTERN NOTATIONS:
-- "C/C", "C-C", "CTR-CTR" (Center-to-Center) - e.g., "35 C/C" NOT "35"
-- "B.C.", "BC", "PCD" (Bolt Circle Diameter) - e.g., "Ø44 B.C." NOT "Ø44"
-- "SQ" (Square pattern) - e.g., "10 SQ" NOT "10"
+## WHAT TO EXTRACT
+- Linear dimensions with units (0.75in, 32mm, 1.95in)
+- Fractions and mixed fractions (1/4", 3 1/4", 4 7/8")
+- Toleranced dimensions (0.2500in -0.0015 -0.0030)
+- Compound dimensions (0.188" Wd. x 7/8" Lg. Key)
+- Diameters and radii (Ø5, R2.5)
+- Thread callouts (6-32, M8x1.25, 3/4"-16 UN/UNF)
+- Angles (45°, 89.5°)
+- Text notes with dimensions (Usable Length Range Max.: 1 3/4")
 
-### REFERENCE/DATUM MARKERS (critical for GD&T):
-- "REF", "REFERENCE" - e.g., "0.95 REF" NOT "0.95"
-- "NOM", "NOMINAL" - e.g., "25 NOM" NOT "25"
-- "BSC", "BASIC" - e.g., "45° BSC" NOT "45°"
-- "TRUE" - e.g., "R10 TRUE" NOT "R10"
+## WHAT TO IGNORE
+- Part numbers (PN-12345, 91388A212, 6296K81)
+- Company names (McMaster-Carr)
+- Drawing titles
+- Revision marks
+- Scale indicators
+- Zone letters/numbers at borders
 
-### LIMIT DIMENSIONS:
-- "MAX", "MAXIMUM" - e.g., "15 MAX" NOT "15"
-- "MIN", "MINIMUM" - e.g., "3 MIN" NOT "3"
+## EXAMPLES
 
-### DEPTH/COUNTERBORE/COUNTERSINK:
-- "DEEP", "DP", "↧" - e.g., "Ø5 ↧10" NOT "Ø5"
-- "CBORE", "C'BORE", "⌴" - e.g., "Ø10 CBORE Ø15" 
-- "CSINK", "C'SINK", "⌵" - e.g., "Ø3 CSINK 90°"
-- "THRU", "THROUGH" - e.g., "Ø6 THRU" NOT "Ø6"
+Input drawing shows: "0.188" Wd. x 7/8" Lg. Key"
+✓ CORRECT: ["0.188\" Wd. x 7/8\" Lg. Key"]
+✗ WRONG: ["0.188\" Wd.", "7/8\" Lg."]
 
-### SURFACE/FINISH:
-- "BOTH SIDES", "2 SURFACES" - e.g., "0.8 BOTH SIDES"
-- "FAR SIDE", "NEAR SIDE"
+Input drawing shows: "0.2500in" with "-0.0015" and "-0.0030" next to it
+✓ CORRECT: ["0.2500in -0.0015 -0.0030"]
+✗ WRONG: ["0.2500in", "-0.0015", "-0.0030"]
 
-## EXAMPLES - CORRECT vs WRONG:
+Input drawing shows: "3 1/4"" dimension
+✓ CORRECT: ["3 1/4\""]
+✗ WRONG: ["3", "1/4\""]
 
-✓ CORRECT: "6-32 Thread"       ✗ WRONG: (not extracted)
-✓ CORRECT: "For 8-32 Mounting Fastener" ✗ WRONG: (not extracted)
-✓ CORRECT: "M8x1.25 (4x)"      ✗ WRONG: "M8x1.25" or "M8"
-✓ CORRECT: "1/4-20 UNC"        ✗ WRONG: (not extracted)
-✓ CORRECT: "35 C/C"            ✗ WRONG: "35"
-✓ CORRECT: "Ø3.4 (2x)"         ✗ WRONG: "Ø3.4"  
-✓ CORRECT: "Ø7.5 (2x)"         ✗ WRONG: "Ø7.5"
-✓ CORRECT: "0.95 REF"          ✗ WRONG: "0.95"
-✓ CORRECT: "89.5°"             ✗ WRONG: "89.5"
-✓ CORRECT: "R5 TYP"            ✗ WRONG: "R5"
-✓ CORRECT: "Ø44 B.C."          ✗ WRONG: "Ø44"
-✓ CORRECT: "15.3 +0.1/-0"      ✗ WRONG: "15.3"
-✓ CORRECT: "25 MAX"            ✗ WRONG: "25"
-✓ CORRECT: "Ø6 THRU"           ✗ WRONG: "Ø6"
+Input drawing shows "16mm" in two different places
+✓ CORRECT: ["16mm", "16mm"]
+✗ WRONG: ["16mm"]
 
-## WHAT TO EXTRACT:
-- Linear dimensions with ALL modifiers
-- Diameters (Ø, ⌀) with quantity and depth callouts
-- Radii (R) with TYP or quantity markers
-- Angles (°) with BSC or quantity markers
-- Tolerances (±, +/-)
-- **ALL thread callouts** (6-32, M8x1.25, 1/4-20, etc.) - VERY IMPORTANT!
-- Thread notes like "For 8-32" or "Tap 1/4-20"
-- Chamfers (C, ×45°)
-- All reference and limit dimensions
-
-## WHAT TO IGNORE (not dimensions):
-- Part numbers (e.g., "PN-12345", "F15848", "5236A18")
-- Revision letters (e.g., "REV A", "REV B")
-- Drawing numbers
-- Scale indicators (e.g., "SCALE 2:1", "2:1 (1:1)")
-- Company names and logos (e.g., "McMaster-Carr", "LEDiL")
-- Title block text (PRODUCT, MATERIAL, SIZE, SHEET, TYPE, COLOUR/COATING)
-- Section labels (e.g., "SECTION A-A", "VIEW B-B", "Section A-A")
-- Zone/grid references (letters A-H and numbers 1-4 at drawing borders)
-- Notes section text that are instructions, not measurements
-- "FIRST ANGLE PROJECTION" text
-- Component/BOM table entries
-- Material specifications (e.g., "PBT", "WHITE")
-- Product names/descriptions (e.g., "Manual-Positioning Slide with Dial")
-
-## RULES:
-1. Extract the EXACT text as it appears INCLUDING all modifiers
-2. Include symbols (Ø, R, ±, °, ×) that are part of the dimension
-3. Include tolerance values attached to dimensions
-4. Include quantity multipliers (2x, 4x) that appear near the dimension
-5. Include spacing notations (C/C, B.C.) that appear with the dimension
-6. **ALWAYS extract thread callouts** - they are inspection characteristics!
-7. If a modifier is visually associated with a dimension, include it
-8. Do NOT split a dimension from its modifiers
-9. Do NOT infer or calculate values
-10. If you cannot clearly read a dimension, skip it
-
-## QUALITY CHECK (verify before returning):
-- Did I extract ALL thread callouts (6-32, 8-32, M6x1.0, etc.)?
-- Did I include "Thread" or "THD" where they appear with threads?
-- Did I include "For X-XX" thread references?
-- Did I include "(2x)" or "(4x)" where they appear?
-- Did I include "C/C" where it appears?
-- Did I include "TYP" where it appears?
-- Did I include "REF" where it appears?
-- Did I include "MAX"/"MIN" where they appear?
-- Did I include tolerance values where they appear?
-- Did I include "THRU" or depth callouts where they appear?
-
-Return a JSON object with this exact structure:
+## RESPONSE FORMAT
+Return ONLY a JSON object:
 {
-    "dimensions": ["6-32 Thread", "For 8-32 Mounting Fastener", "35 C/C", "Ø3.4 (2x)", "89.5°", "0.95 REF", "R5 TYP"]
+    "dimensions": ["0.75in", "3 1/4\"", "0.2500in -0.0015 -0.0030", "0.188\" Wd. x 7/8\" Lg. Key"]
 }
 
-If no dimensions are found, return:
+If no dimensions found:
 {
     "dimensions": []
-}
-
-Return ONLY the JSON object, no other text."""
+}"""
     
     def _parse_dimension_response(self, response: dict) -> list[str]:
         """Parse Gemini's response and extract dimension values"""
         try:
-            # Navigate Gemini response structure
             candidates = response.get("candidates", [])
             if not candidates:
                 return []
@@ -250,11 +188,9 @@ Return ONLY the JSON object, no other text."""
             
             text = parts[0].get("text", "")
             
-            # Parse JSON from response
-            # Handle potential markdown code blocks
+            # Handle markdown code blocks
             text = text.strip()
             if text.startswith("```"):
-                # Remove markdown code block
                 lines = text.split("\n")
                 text = "\n".join(lines[1:-1])
             
@@ -281,23 +217,26 @@ Return ONLY the JSON object, no other text."""
             )
     
     async def detect_grid(self, image_bytes: bytes) -> Optional[dict]:
-        """
-        Use Gemini Vision to detect the grid reference system on the drawing.
-        
-        Returns:
-            Grid info dict or None if no grid detected:
-            {
-                "columns": ["A", "B", "C", "D", "E", "F", "G", "H"],
-                "rows": ["1", "2", "3", "4"],
-                "boundaries": {
-                    "column_edges": [0, 125, 250, ...],  # Normalized x positions
-                    "row_edges": [0, 250, 500, ...]      # Normalized y positions
-                }
-            }
-        """
+        """Detect grid reference system on the drawing."""
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
         
-        prompt = self._build_grid_detection_prompt()
+        prompt = """Analyze this engineering drawing and identify the grid reference system if present.
+
+Return a JSON object:
+{
+    "has_grid": true,
+    "columns": ["A", "B", "C", "D", "E", "F", "G", "H"],
+    "rows": ["1", "2", "3", "4"],
+    "column_count": 8,
+    "row_count": 4
+}
+
+If no grid is found:
+{
+    "has_grid": false
+}
+
+Return ONLY the JSON object."""
         
         payload = {
             "contents": [{
@@ -328,37 +267,9 @@ Return ONLY the JSON object, no other text."""
                 response.raise_for_status()
                 result = response.json()
         except Exception:
-            # Grid detection is optional - return None on any error
             return None
         
         return self._parse_grid_response(result)
-    
-    def _build_grid_detection_prompt(self) -> str:
-        """Build the prompt for grid detection"""
-        return """Analyze this engineering drawing and identify the grid reference system if present.
-
-Look for:
-1. Column letters (typically A-H or A-J) along the top or bottom edge
-2. Row numbers (typically 1-4 or 1-6) along the left or right edge
-3. Grid lines dividing the drawing into zones
-
-If a grid system is present, estimate the boundaries of each zone.
-
-Return a JSON object:
-{
-    "has_grid": true,
-    "columns": ["A", "B", "C", "D", "E", "F", "G", "H"],
-    "rows": ["1", "2", "3", "4"],
-    "column_count": 8,
-    "row_count": 4
-}
-
-If no grid is found:
-{
-    "has_grid": false
-}
-
-Return ONLY the JSON object."""
     
     def _parse_grid_response(self, response: dict) -> Optional[dict]:
         """Parse Gemini's grid detection response"""
@@ -388,7 +299,6 @@ Return ONLY the JSON object."""
             if not columns or not rows:
                 return None
             
-            # Calculate evenly-distributed boundaries
             col_count = len(columns)
             row_count = len(rows)
             
@@ -414,7 +324,6 @@ Return ONLY the JSON object."""
             return None
 
 
-# Factory function
 def create_vision_service(api_key: Optional[str] = None) -> VisionService:
     """Create vision service instance"""
     return VisionService(api_key=api_key)
