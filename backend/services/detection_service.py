@@ -118,6 +118,23 @@ class DetectionService:
         re.VERBOSE | re.IGNORECASE
     )
     
+    # Thread callout patterns (UNC, UNF, metric, pipe threads)
+    THREAD_PATTERN = re.compile(
+        r'''
+        (?:
+            # Standard inch threads: 6-32, 1/4-20, 10-24, #8-32
+            (?:\#?\d+|\d+/\d+)\s*-\s*\d+\s*(?:UNC|UNF|UN|UNEF|UNJC|UNJF)?\s*(?:THD|THREAD|THRD)?|
+            # Metric threads: M6x1.0, M8-1.25
+            M\d+(?:\.\d+)?\s*[xX×-]\s*\d+(?:\.\d+)?|
+            # Pipe threads: 1/4-18 NPT, 3/8 NPTF
+            \d+/\d+\s*-?\s*\d*\s*(?:NPT|NPTF|BSPT|BSPP|NPS)|
+            # "For X-XX" pattern: "For 8-32"
+            [Ff]or\s+(?:\#?\d+|\d+/\d+)\s*-\s*\d+
+        )
+        ''',
+        re.VERBOSE | re.IGNORECASE
+    )
+    
     STANDARD_GRID_COLUMNS = ['H', 'G', 'F', 'E', 'D', 'C', 'B', 'A']
     STANDARD_GRID_ROWS = ['4', '3', '2', '1']
     
@@ -210,9 +227,29 @@ class DetectionService:
         grouped_ocr = self._group_compound_dimensions(ocr_detections)
         
         dimension_values = await self._run_gemini(image_bytes)
+        
+        # Extract thread callouts from OCR (Gemini often misses these)
+        thread_callouts = self._extract_thread_callouts(grouped_ocr)
+        
+        # Add thread callouts to dimension values if not already present
+        for thread in thread_callouts:
+            normalized_thread = self._normalize_for_matching(thread)
+            if not any(self._normalize_for_matching(d) == normalized_thread for d in dimension_values):
+                dimension_values.append(thread)
+        
         matched_dimensions = self._match_dimensions(grouped_ocr, dimension_values)
         sorted_dimensions = self._sort_reading_order(matched_dimensions)
         return sorted_dimensions
+    
+    def _extract_thread_callouts(self, ocr_detections: List[OCRDetection]) -> List[str]:
+        """Extract thread specifications from OCR detections."""
+        threads = []
+        for ocr in ocr_detections:
+            text = ocr.text.strip()
+            if self.THREAD_PATTERN.search(text):
+                # Clean up the thread callout
+                threads.append(text)
+        return threads
     
     def _calculate_zone(
         self, 
