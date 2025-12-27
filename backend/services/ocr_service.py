@@ -217,16 +217,17 @@ class OCRService:
     def group_adjacent_text(
         self, 
         detections: List[OCRDetection],
-        horizontal_threshold: int = 25,  # Increased from 20 for compound dimensions
-        vertical_threshold: int = 12     # Slightly increased
+        horizontal_threshold: int = 30,  # Increased for compound dimensions
+        vertical_threshold: int = 15     # Increased for better line detection
     ) -> List[OCRDetection]:
         """
         Group horizontally adjacent text detections into single entries.
         
-        ENHANCED for compound dimensions:
-        - 0.188" Wd. x 7/8" Lg. should stay together
-        - 0.2500in -0.0015 -0.0030 should stay together
-        - Small dimensions close together should stay separate
+        ENHANCED for:
+        - Mixed fractions: 3 1/4" should stay together
+        - Compound dimensions: 0.188" Wd. x 7/8" Lg. should stay together
+        - Tolerance stacks: 0.2500in -0.0015 -0.0030 should stay together
+        - BUT separate dimensions that happen to be close should NOT merge
         
         Args:
             detections: List of individual text detections
@@ -261,31 +262,79 @@ class OCRService:
             should_group = False
             
             if y_diff <= vertical_threshold and 0 <= x_gap <= horizontal_threshold:
-                # Check if this looks like a continuation
-                # (tolerance value, modifier, or dimension component)
                 curr_text = detection.text.strip()
                 prev_text = prev.text.strip()
                 
-                # Group tolerance values with their base dimension
-                is_tolerance = bool(re.match(r'^[+-±]?\s*[\d.]+$', curr_text))
+                # Get the full current group text for context
+                group_text = " ".join(d.text.strip() for d in current_group)
                 
-                # Group modifiers like "Wd.", "Lg.", "x", etc.
-                is_modifier = bool(re.match(
-                    r'^(?:x|X|×|Wd\.?|Lg\.?|Dia\.?|Rad\.?|THK\.?|TYP\.?|REF\.?|MAX\.?|MIN\.?)$', 
+                # CASE 1: Mixed fraction - whole number followed by fraction
+                # e.g., "3" followed by "1/4" or "3/4"
+                is_mixed_fraction = (
+                    prev_text.isdigit() and 
+                    bool(re.match(r'^\d+/\d+["\']?$', curr_text))
+                )
+                
+                # CASE 2: Fraction followed by unit/quote
+                # e.g., "1/4" followed by '"'
+                is_fraction_unit = (
+                    bool(re.match(r'^\d+/\d+$', prev_text)) and
+                    curr_text in ['"', "'", "in", "mm"]
+                )
+                
+                # CASE 3: Compound dimension components
+                # e.g., "Wd." "x" "7/8" "Lg."
+                is_compound_part = bool(re.match(
+                    r'^(?:x|X|×|Wd\.?|Lg\.?|Dia\.?|Rad\.?|THK\.?|Key)$', 
                     curr_text, re.IGNORECASE
                 ))
                 
-                # Group if tolerance or modifier
-                if is_tolerance or is_modifier:
+                # CASE 4: Previous was a modifier, current is a dimension
+                # e.g., "x" followed by "7/8"
+                prev_is_connector = prev_text.lower() in ['x', '×']
+                
+                # CASE 5: Tolerance values
+                is_tolerance = bool(re.match(r'^[+-±]\s*[\d.]+$', curr_text))
+                
+                # CASE 6: Dimension followed by modifier
+                # e.g., "0.188" followed by "Wd."
+                prev_is_dimension = self._looks_like_dimension(prev_text)
+                curr_is_modifier = bool(re.match(
+                    r'^(?:Wd\.?|Lg\.?|Dia\.?|Rad\.?|THK\.?|TYP\.?|REF\.?|MAX\.?|MIN\.?|Key)$', 
+                    curr_text, re.IGNORECASE
+                ))
+                
+                # CASE 7: Very small gap - likely same element
+                very_small_gap = x_gap <= 8
+                
+                # Decide grouping
+                if is_mixed_fraction:
                     should_group = True
-                # Group if gap is very small (likely same dimension)
-                elif x_gap <= 10:
+                elif is_fraction_unit:
                     should_group = True
-                # Don't group if both look like separate dimensions
-                elif self._looks_like_dimension(prev_text) and self._looks_like_dimension(curr_text):
-                    should_group = False
+                elif is_compound_part:
+                    should_group = True
+                elif prev_is_connector:
+                    should_group = True
+                elif is_tolerance:
+                    should_group = True
+                elif prev_is_dimension and curr_is_modifier:
+                    should_group = True
+                elif very_small_gap:
+                    # Very small gap - group unless both are standalone dimensions
+                    if self._is_standalone_dimension(prev_text) and self._is_standalone_dimension(curr_text):
+                        should_group = False
+                    else:
+                        should_group = True
                 else:
-                    should_group = True
+                    # Larger gap - don't group if both look like separate dimensions
+                    if self._is_standalone_dimension(prev_text) and self._is_standalone_dimension(curr_text):
+                        should_group = False
+                    # Don't group if current starts a new dimension pattern
+                    elif self._starts_new_dimension(curr_text):
+                        should_group = False
+                    else:
+                        should_group = True
             
             if should_group:
                 current_group.append(detection)
@@ -301,13 +350,31 @@ class OCRService:
         return grouped
     
     def _looks_like_dimension(self, text: str) -> bool:
-        """Check if text looks like a standalone dimension value."""
+        """Check if text looks like a dimension value (may be partial)."""
         text = text.strip()
-        # Matches: 0.45, 3.5", Ø5, R2, 1/4, 3 3/4, etc.
+        # Matches: 0.45, 3.5", Ø5, R2, 1/4, 3, 0.188, etc.
         return bool(re.match(
             r'^(?:[Øø⌀R]?\s*)?[\d]+(?:[./]\d+)?(?:\s*\d+/\d+)?(?:\s*["\']|mm|in)?$',
             text, re.IGNORECASE
         ))
+    
+    def _is_standalone_dimension(self, text: str) -> bool:
+        """Check if text is a complete standalone dimension (not a component)."""
+        text = text.strip()
+        # Must have a number and typically a unit or be a clear decimal
+        # Matches: 0.45", 3 1/4", 4 7/8", 0.094", 1/4", but NOT just "3" or "x"
+        return bool(re.match(
+            r'^(?:[Øø⌀R]?\s*)?\d+(?:\.\d+)?(?:\s+\d+/\d+|\s*/\s*\d+)?\s*["\']$|'  # With unit: 3 1/4", 0.45"
+            r'^(?:[Øø⌀R]?\s*)?\d+\.\d{2,}\s*["\']?$|'  # Decimal: 0.094, 0.188"
+            r'^(?:[Øø⌀R])\s*\d+(?:\.\d+)?\s*["\']?$',   # Diameter/Radius: Ø5, R2.5
+            text, re.IGNORECASE
+        ))
+    
+    def _starts_new_dimension(self, text: str) -> bool:
+        """Check if text starts a new dimension (diameter, radius, etc.)."""
+        text = text.strip()
+        # Starts with diameter or radius symbol
+        return bool(re.match(r'^[Øø⌀R]\s*\d', text, re.IGNORECASE))
     
     def _merge_group(self, group: List[OCRDetection]) -> OCRDetection:
         """Merge a group of adjacent detections into one"""
