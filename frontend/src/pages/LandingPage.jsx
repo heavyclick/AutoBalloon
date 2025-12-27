@@ -13,7 +13,6 @@ import { FAQ } from '../components/FAQ';
 import { Footer } from '../components/Footer';
 import { DropZone } from '../components/DropZone';
 import { PromoRedemption, usePromoCode } from '../components/PromoRedemption';
-import { SecurityBadge } from '../components/SecurityBadge';
 import { API_BASE_URL } from '../constants/config';
 
 export function LandingPage() {
