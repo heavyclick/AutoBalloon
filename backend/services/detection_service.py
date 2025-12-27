@@ -1,40 +1,36 @@
 """
-Detection Service - Enhanced with Gemini Location Hints
+Detection Service - AS9102 Compliant Dimension Detection
 Orchestrates OCR + Gemini Vision fusion for accurate dimension detection.
 
-KEY IMPROVEMENTS:
-1. Gemini returns dimensions WITH approximate bounding boxes
-2. Better handling of partial OCR matches
-3. Prevents over-grouping of adjacent dimensions
-4. Handles vertical tolerance stacks
-5. Uses pattern library for robust detection
+Key improvements:
+1. Better OCR grouping - keeps modifiers with dimensions
+2. Vertical text grouping - "For 3.0in" + "Flange OD" below
+3. No over-grouping - two separate dimensions stay separate
+4. Location-based matching using Gemini coordinates
 """
 import re
-import json
 from typing import Optional, List, Dict, Any, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from datetime import datetime
 
 from services.ocr_service import OCRService, OCRDetection, create_ocr_service
 from services.vision_service import VisionService, create_vision_service
 from services.file_service import FileService, PageImage, FileProcessingResult
-from services.pattern_library import ManufacturingPatterns, PATTERNS
+from services.pattern_library import PATTERNS
 from models.schemas import Dimension, BoundingBox, ErrorCode
 
 
-# Global debug storage
+# Debug storage
 DEBUG_LOG = []
 MAX_DEBUG_ENTRIES = 10
 
 
 def get_debug_log():
-    """Return the debug log for the /api/debug endpoint"""
     return DEBUG_LOG
 
 
 def add_debug_entry(entry: dict):
-    """Add a debug entry"""
     global DEBUG_LOG
     entry['timestamp'] = datetime.utcnow().isoformat()
     DEBUG_LOG.append(entry)
@@ -43,8 +39,16 @@ def add_debug_entry(entry: dict):
 
 
 @dataclass
+class GeminiDimension:
+    """Dimension from Gemini with location."""
+    value: str
+    x_percent: float
+    y_percent: float
+    confidence: float
+
+
+@dataclass
 class PageDetectionResult:
-    """Result of dimension detection for a single page"""
     page_number: int
     dimensions: List[Dimension]
     grid_detected: bool
@@ -55,7 +59,6 @@ class PageDetectionResult:
 
 @dataclass
 class MultiPageDetectionResult:
-    """Result of dimension detection for all pages"""
     success: bool
     total_pages: int
     pages: List[PageDetectionResult]
@@ -63,22 +66,20 @@ class MultiPageDetectionResult:
     error_message: Optional[str] = None
 
 
-@dataclass
-class GeminiDimension:
-    """Dimension returned by Gemini with location hint"""
-    value: str
-    x_percent: float  # Approximate x position (0-100)
-    y_percent: float  # Approximate y position (0-100)
-    confidence: float
-
-
 class DetectionService:
-    """
-    Enhanced dimension detection with Gemini location hints.
-    """
+    """AS9102-compliant dimension detection."""
     
     STANDARD_GRID_COLUMNS = ['H', 'G', 'F', 'E', 'D', 'C', 'B', 'A']
     STANDARD_GRID_ROWS = ['4', '3', '2', '1']
+    
+    # Patterns for dimension modifiers that should stay attached
+    MODIFIER_PATTERNS = [
+        r'^\d+[xX]$',           # 4X, 2X
+        r'^[xX]\d+$',           # x4, x2
+        r'^\(\d+[xX]\)$',       # (4X)
+        r'^TYP\.?$',            # TYP
+        r'^REF\.?$',            # REF
+    ]
     
     def __init__(
         self, 
@@ -97,7 +98,7 @@ class DetectionService:
         file_bytes: bytes,
         filename: Optional[str] = None
     ) -> MultiPageDetectionResult:
-        """Detect dimensions from a multi-page PDF or single image."""
+        """Detect dimensions from PDF or image."""
         debug_entry = {'filename': filename, 'pages': []}
         
         file_result = self.file_service.process_file(file_bytes, filename)
@@ -111,138 +112,138 @@ class DetectionService:
             )
         
         page_results = []
-        current_dimension_id = 1
+        current_id = 1
         
         for page_image in file_result.pages:
             page_debug = {'page_number': page_image.page_number}
             
-            page_dimensions, page_debug_info = await self._detect_dimensions_on_page(
+            dimensions, debug_info = await self._detect_on_page(
                 page_image.image_bytes,
                 page_image.width,
                 page_image.height
             )
             
-            page_debug.update(page_debug_info)
+            page_debug.update(debug_info)
             
-            for dim in page_dimensions:
+            for dim in dimensions:
                 dim.zone = self._calculate_zone(
                     dim.bounding_box.center_x,
-                    dim.bounding_box.center_y,
-                    None
+                    dim.bounding_box.center_y
                 )
-                dim.id = current_dimension_id
+                dim.id = current_id
                 dim.page = page_image.page_number
-                current_dimension_id += 1
+                current_id += 1
             
             page_debug['final_dimensions'] = [
                 {'id': d.id, 'value': d.value, 'zone': d.zone} 
-                for d in page_dimensions
+                for d in dimensions
             ]
             debug_entry['pages'].append(page_debug)
             
             page_results.append(PageDetectionResult(
                 page_number=page_image.page_number,
-                dimensions=page_dimensions,
+                dimensions=dimensions,
                 grid_detected=True,
                 image_base64=page_image.base64_image,
                 width=page_image.width,
                 height=page_image.height
             ))
         
-        all_dimensions = []
-        for page_result in page_results:
-            all_dimensions.extend(page_result.dimensions)
+        all_dims = []
+        for pr in page_results:
+            all_dims.extend(pr.dimensions)
         
-        debug_entry['total_dimensions'] = len(all_dimensions)
+        debug_entry['total_dimensions'] = len(all_dims)
         add_debug_entry(debug_entry)
         
         return MultiPageDetectionResult(
             success=True,
             total_pages=file_result.total_pages,
             pages=page_results,
-            all_dimensions=all_dimensions
+            all_dimensions=all_dims
         )
     
-    async def _detect_dimensions_on_page(
+    async def _detect_on_page(
         self,
         image_bytes: bytes,
-        image_width: int,
-        image_height: int
+        width: int,
+        height: int
     ) -> Tuple[List[Dimension], dict]:
-        """Detect dimensions for a single page."""
-        debug_info = {}
+        """Detect dimensions on single page."""
+        debug = {}
         
-        # Step 1: Run OCR - get RAW tokens
-        raw_ocr = await self._run_ocr_raw(image_bytes, image_width, image_height)
-        debug_info['raw_ocr_count'] = len(raw_ocr)
-        debug_info['raw_ocr_sample'] = [d.text for d in raw_ocr[:30]]
+        # 1. Get raw OCR
+        raw_ocr = await self._run_ocr(image_bytes, width, height)
+        debug['raw_ocr_count'] = len(raw_ocr)
+        debug['raw_ocr_sample'] = [d.text for d in raw_ocr[:30]]
         
-        # Step 2: Smart grouping - avoid over-grouping complete dimensions
-        grouped_ocr = self._smart_group_ocr(raw_ocr)
-        debug_info['grouped_ocr_count'] = len(grouped_ocr)
-        debug_info['grouped_ocr'] = [d.text for d in grouped_ocr]
+        # 2. Group OCR intelligently
+        grouped_ocr = self._group_ocr(raw_ocr)
+        debug['grouped_ocr_count'] = len(grouped_ocr)
+        debug['grouped_ocr'] = [d.text for d in grouped_ocr]
         
-        # Step 3: Run Gemini with location hints
-        gemini_dimensions = await self._run_gemini_with_locations(image_bytes)
-        debug_info['gemini_dimensions'] = [
-            {'value': d.value, 'x': d.x_percent, 'y': d.y_percent} 
-            for d in gemini_dimensions
+        # 3. Get Gemini dimensions with locations
+        gemini_dims = await self._run_gemini(image_bytes)
+        debug['gemini_dimensions'] = [
+            {'value': d.value, 'x': d.x_percent, 'y': d.y_percent}
+            for d in gemini_dims
         ]
         
-        # Step 4: Extract thread callouts from OCR as backup
-        thread_callouts = self._extract_thread_callouts(grouped_ocr)
-        debug_info['thread_callouts_from_ocr'] = thread_callouts
+        # 4. Match using LOCATION-FIRST strategy
+        matched = self._match_by_location(grouped_ocr, raw_ocr, gemini_dims)
+        debug['matched_count'] = len(matched)
         
-        # Step 5: Match with improved algorithm
-        matched_dimensions = self._match_dimensions_smart(
-            grouped_ocr, 
-            raw_ocr,
-            gemini_dimensions,
-            thread_callouts
-        )
-        debug_info['matched_count'] = len(matched_dimensions)
+        # 5. Sort reading order
+        sorted_dims = self._sort_reading_order(matched)
         
-        # Step 6: Sort in reading order
-        sorted_dimensions = self._sort_reading_order(matched_dimensions)
-        
-        return sorted_dimensions, debug_info
+        return sorted_dims, debug
     
-    async def _run_ocr_raw(
-        self, 
-        image_bytes: bytes, 
-        image_width: int, 
-        image_height: int
-    ) -> List[OCRDetection]:
-        """Run OCR and return raw detections."""
+    async def _run_ocr(self, image_bytes: bytes, w: int, h: int) -> List[OCRDetection]:
+        """Run OCR."""
         if not self.ocr_service:
             return []
-        
         try:
-            return await self.ocr_service.detect_text(
-                image_bytes, image_width, image_height
-            )
+            return await self.ocr_service.detect_text(image_bytes, w, h)
         except Exception as e:
             print(f"OCR error: {e}")
             return []
     
-    def _smart_group_ocr(self, detections: List[OCRDetection]) -> List[OCRDetection]:
+    async def _run_gemini(self, image_bytes: bytes) -> List[GeminiDimension]:
+        """Run Gemini with locations."""
+        if not self.vision_service:
+            return []
+        try:
+            results = await self.vision_service.identify_dimensions_with_locations(image_bytes)
+            return [
+                GeminiDimension(
+                    value=d['value'],
+                    x_percent=d.get('x', 50),
+                    y_percent=d.get('y', 50),
+                    confidence=d.get('confidence', 0.8)
+                )
+                for d in results
+            ]
+        except Exception as e:
+            print(f"Gemini error: {e}")
+            return []
+    
+    def _group_ocr(self, detections: List[OCRDetection]) -> List[OCRDetection]:
         """
-        Smart grouping that:
-        1. Groups tolerance stacks (including vertical)
-        2. Groups mixed fractions
-        3. Groups compound dimensions (Wd. x Lg.)
-        4. Does NOT merge two complete standalone dimensions
+        Group OCR tokens intelligently:
+        - Group modifiers (4X) with adjacent dimensions
+        - Group vertically stacked text (For 3.0in / Flange OD)
+        - Group tolerances with base dimension
+        - DON'T group two separate complete dimensions
         """
         if not detections:
             return []
         
-        # Sort by Y, then X
+        # Sort by Y then X
         sorted_dets = sorted(
             detections,
             key=lambda d: (d.bounding_box["ymin"], d.bounding_box["xmin"])
         )
         
-        # Build adjacency groups
         groups = []
         used = set()
         
@@ -253,153 +254,211 @@ class DetectionService:
             group = [det]
             used.add(i)
             
-            # Look for adjacent tokens to merge
-            self._expand_group(group, i, sorted_dets, used)
-            
+            # Try to expand this group
+            self._expand_group(group, sorted_dets, used)
             groups.append(group)
         
-        # Merge each group
-        return [self._merge_group_smart(g) for g in groups]
+        return [self._merge_group(g) for g in groups]
     
     def _expand_group(
-        self, 
-        group: List[OCRDetection], 
-        start_idx: int,
+        self,
+        group: List[OCRDetection],
         all_dets: List[OCRDetection],
         used: set
     ):
-        """Expand a group by finding related tokens."""
-        HORIZONTAL_THRESHOLD = 60
-        VERTICAL_THRESHOLD = 25
-        VERTICAL_STACK_THRESHOLD = 40
+        """Expand group by finding related tokens."""
+        H_THRESH = 50   # Horizontal threshold
+        V_THRESH = 25   # Vertical threshold (same line)
+        V_STACK = 35    # Vertical stacking threshold
         
-        for i, det in enumerate(all_dets):
-            if i in used:
-                continue
+        changed = True
+        while changed:
+            changed = False
             
-            for group_det in group:
-                gbox = group_det.bounding_box
-                dbox = det.bounding_box
+            for i, det in enumerate(all_dets):
+                if i in used:
+                    continue
                 
-                g_center_x = (gbox["xmin"] + gbox["xmax"]) / 2
-                g_center_y = (gbox["ymin"] + gbox["ymax"]) / 2
-                d_center_x = (dbox["xmin"] + dbox["xmax"]) / 2
-                d_center_y = (dbox["ymin"] + dbox["ymax"]) / 2
-                
-                x_diff = abs(d_center_x - g_center_x)
-                y_diff = abs(d_center_y - g_center_y)
-                x_gap = dbox["xmin"] - gbox["xmax"]
-                
-                curr_text = det.text.strip()
-                prev_text = group_det.text.strip()
-                
-                should_merge = False
-                
-                # CASE 1: Horizontal adjacency (same line)
-                if y_diff <= VERTICAL_THRESHOLD and -10 <= x_gap <= HORIZONTAL_THRESHOLD:
-                    should_merge = self._should_merge_horizontal(prev_text, curr_text, x_gap)
-                
-                # CASE 2: Vertical tolerance stack
-                elif x_diff <= 30 and 0 < (d_center_y - g_center_y) <= VERTICAL_STACK_THRESHOLD:
-                    if PATTERNS.is_tolerance(curr_text):
-                        should_merge = True
-                
-                if should_merge:
-                    group.append(det)
-                    used.add(i)
-                    self._expand_group(group, i, all_dets, used)
-                    break
+                for g_det in list(group):
+                    if self._should_group(g_det, det, H_THRESH, V_THRESH, V_STACK):
+                        group.append(det)
+                        used.add(i)
+                        changed = True
+                        break
+    
+    def _should_group(
+        self,
+        det1: OCRDetection,
+        det2: OCRDetection,
+        h_thresh: int,
+        v_thresh: int,
+        v_stack: int
+    ) -> bool:
+        """Determine if two detections should be grouped."""
+        b1 = det1.bounding_box
+        b2 = det2.bounding_box
+        
+        # Calculate positions
+        c1_x = (b1["xmin"] + b1["xmax"]) / 2
+        c1_y = (b1["ymin"] + b1["ymax"]) / 2
+        c2_x = (b2["xmin"] + b2["xmax"]) / 2
+        c2_y = (b2["ymin"] + b2["ymax"]) / 2
+        
+        x_gap = b2["xmin"] - b1["xmax"]
+        y_diff = abs(c2_y - c1_y)
+        x_diff = abs(c2_x - c1_x)
+        
+        t1 = det1.text.strip()
+        t2 = det2.text.strip()
+        
+        # Case 1: Horizontal adjacency (same line)
+        if y_diff <= v_thresh and -5 <= x_gap <= h_thresh:
+            return self._should_merge_horizontal(t1, t2, x_gap)
+        
+        # Case 2: Vertical stacking (text below)
+        if x_diff <= 40 and 0 < (c2_y - c1_y) <= v_stack:
+            return self._should_merge_vertical(t1, t2)
+        
+        return False
     
     def _should_merge_horizontal(self, prev: str, curr: str, gap: float) -> bool:
-        """Determine if two horizontal tokens should merge."""
+        """Should horizontally adjacent tokens merge?"""
         
-        # 1. Mixed fraction: "3" + "1/4"
+        # Modifier + dimension: "4X" + "0.2in"
+        if self._is_modifier(prev) and self._looks_like_dimension(curr):
+            return True
+        
+        # Dimension + modifier: "0.2in" + "4X"
+        if self._looks_like_dimension(prev) and self._is_modifier(curr):
+            return True
+        
+        # Mixed fraction: "3" + "1/4"
         if prev.isdigit() and re.match(r'^\d+/\d+["\']?$', curr):
             return True
         
-        # 2. Fraction + unit: "1/4" + '"'
+        # Fraction + unit: "1/4" + '"'
         if re.match(r'^\d+/\d+$', prev) and curr in ['"', "'", "in", "mm"]:
             return True
         
-        # 3. Tolerance
+        # Tolerance: dimension + "+0.005" or "-0.003"
         if PATTERNS.is_tolerance(curr):
             return True
         
-        # 4. Compound modifiers
-        if re.match(r'^(?:x|X|×|Wd\.?|Lg\.?|Dia\.?|Rad\.?|THK\.?|Key)$', curr, re.IGNORECASE):
+        # Compound connectors: anything + "x", "Wd.", "Lg.", "Key"
+        if re.match(r'^(?:x|X|×|Wd\.?|Lg\.?|Key|OD|ID)$', curr, re.IGNORECASE):
             return True
         
-        # 5. Previous is connector
-        if prev.lower() in ['x', '×']:
+        # After connector: "x" + dimension
+        if prev.lower() in ['x', '×', 'wd.', 'wd', 'lg.', 'lg']:
             return True
         
-        # 6. Unit after number
-        if re.match(r'^\d+\.?\d*$', prev) and curr.lower() in ['in', 'mm', 'cm', '"', "'"]:
+        # Thread parts: dimension + "UN/UNF", "NPT", "(SAE)"
+        if re.match(r'^(?:UN[CF]?|UNF|NPT|SAE|\(SAE\)|Thread|THD)$', curr, re.IGNORECASE):
             return True
         
-        # 7. Thread continuation
-        if re.match(r'^(?:UN[CFJ]?|NPT|SAE|\(SAE\)|Thread|THD|UNF|UNC)$', curr, re.IGNORECASE):
+        # Continuation chars
+        if curr in ['-', '/', '(', ')', ':']:
+            return True
+        if prev in ['-', '/', ':', 'For', 'for']:
             return True
         
-        # 8. Dash or slash (part of thread callout)
-        if curr in ['-', '/', '(', ')'] or prev in ['-', '/']:
+        # "For" prefix: "For" + "3.0in"
+        if prev.lower() == 'for':
             return True
         
-        # DON'T merge two complete standalone dimensions
-        if self._is_complete_dimension(prev) and self._is_complete_dimension(curr):
+        # Unit after number
+        if re.match(r'^[\d.]+$', prev) and curr.lower() in ['in', 'mm', '"', "'"]:
+            return True
+        
+        # Small gap, neither is complete
+        if gap <= 15:
+            if not (self._is_complete_dim(prev) and self._is_complete_dim(curr)):
+                return True
+        
+        # Two complete dimensions - DON'T merge
+        if self._is_complete_dim(prev) and self._is_complete_dim(curr):
             return False
         
-        # Default: merge if gap is small and not both complete
-        return gap <= 25
+        return gap <= 20
     
-    def _is_complete_dimension(self, text: str) -> bool:
-        """Check if text is a complete standalone dimension."""
+    def _should_merge_vertical(self, upper: str, lower: str) -> bool:
+        """Should vertically stacked tokens merge?"""
+        
+        # Tolerance below dimension
+        if PATTERNS.is_tolerance(lower):
+            return True
+        
+        # Descriptive label below dimension (For 3.0in / Flange OD)
+        if re.match(r'^(?:Flange|Tube|OD|ID|Pipe|Thread)$', lower, re.IGNORECASE):
+            return True
+        
+        # "OD" or "ID" labels
+        if lower.upper() in ['OD', 'ID']:
+            return True
+        
+        return False
+    
+    def _is_modifier(self, text: str) -> bool:
+        """Is this a quantity/type modifier?"""
+        text = text.strip()
+        for pat in self.MODIFIER_PATTERNS:
+            if re.match(pat, text, re.IGNORECASE):
+                return True
+        return False
+    
+    def _looks_like_dimension(self, text: str) -> bool:
+        """Does this look like a dimension value?"""
         text = text.strip()
         patterns = [
-            r'^\d+\s+\d+/\d+["\']$',        # Mixed: 3 1/4"
-            r'^\d+/\d+["\']$',               # Fraction: 1/4"
-            r'^\d+\.?\d*["\']$',             # Decimal with unit: 0.45"
-            r'^\d+\.\d{2,}(?:in|mm)?$',      # Long decimal: 0.2500in
-            r'^[Øø]\d+\.?\d*["\']?$',        # Diameter
-            r'^R\d+\.?\d*["\']?$',           # Radius
-            r'^\d+(?:\.\d+)?\s*mm$',         # Metric
+            r'^\d+\.?\d*["\']?$',      # 0.2, 0.2", 25
+            r'^\d+/\d+["\']?$',         # 1/4"
+            r'^\d+\s+\d+/\d+["\']?$',   # 3 1/4"
+            r'^\d+\.?\d*(?:in|mm)$',    # 0.2in, 25mm
+            r'^[ØøR]\d+',               # Ø5, R2.5
         ]
         return any(re.match(p, text, re.IGNORECASE) for p in patterns)
     
-    def _merge_group_smart(self, group: List[OCRDetection]) -> OCRDetection:
-        """Merge a group with smart spacing."""
+    def _is_complete_dim(self, text: str) -> bool:
+        """Is this a complete standalone dimension?"""
+        text = text.strip()
+        patterns = [
+            r'^\d+\s+\d+/\d+["\']$',    # 3 1/4"
+            r'^\d+/\d+["\']$',           # 1/4"
+            r'^\d+\.?\d*["\']$',         # 0.45"
+            r'^\d+\.\d{2,}(?:in|mm)?$',  # 0.2500in
+            r'^[ØøR]\d+\.?\d*["\']?$',   # Ø5
+            r'^\d+(?:\.\d+)?\s*mm$',     # 32mm
+        ]
+        return any(re.match(p, text, re.IGNORECASE) for p in patterns)
+    
+    def _merge_group(self, group: List[OCRDetection]) -> OCRDetection:
+        """Merge group into single detection."""
         if len(group) == 1:
             return group[0]
         
+        # Sort by position
         group.sort(key=lambda d: (d.bounding_box["ymin"], d.bounding_box["xmin"]))
         
-        texts = []
+        # Build text with spacing
+        parts = []
         for i, det in enumerate(group):
-            curr_text = det.text
-            
             if i > 0:
-                prev = group[i - 1]
-                prev_box = prev.bounding_box
-                curr_box = det.bounding_box
+                prev = group[i-1]
+                # Check if vertical vs horizontal
+                y_gap = det.bounding_box["ymin"] - prev.bounding_box["ymax"]
+                x_gap = det.bounding_box["xmin"] - prev.bounding_box["xmax"]
                 
-                y_diff = curr_box["ymin"] - prev_box["ymax"]
-                if y_diff > 10:
-                    texts.append(" ")
-                else:
-                    x_gap = curr_box["xmin"] - prev_box["xmax"]
-                    
-                    if x_gap > 15:
-                        texts.append(" ")
-                    elif curr_text.lower().startswith(('x', '×')):
-                        texts.append(" ")
-                    elif PATTERNS.is_tolerance(curr_text):
-                        texts.append(" ")
-                    elif re.match(r'^\d+/\d+', curr_text) and prev.text.strip().isdigit():
-                        texts.append(" ")
+                if y_gap > 8:
+                    # Vertical - space
+                    parts.append(" ")
+                elif x_gap > 10:
+                    # Horizontal with gap
+                    parts.append(" ")
+                # else: no space
             
-            texts.append(curr_text)
+            parts.append(det.text)
         
-        merged_text = "".join(texts)
+        merged_text = "".join(parts)
         
         merged_box = {
             "xmin": min(d.bounding_box["xmin"] for d in group),
@@ -408,301 +467,186 @@ class DetectionService:
             "ymax": max(d.bounding_box["ymax"] for d in group),
         }
         
-        avg_confidence = sum(d.confidence for d in group) / len(group)
-        
         return OCRDetection(
             text=merged_text,
             bounding_box=merged_box,
-            confidence=avg_confidence
+            confidence=sum(d.confidence for d in group) / len(group)
         )
     
-    def _extract_thread_callouts(self, detections: List[OCRDetection]) -> List[str]:
-        """Extract thread specifications from OCR."""
-        threads = []
-        for det in detections:
-            if PATTERNS.is_thread_callout(det.text):
-                threads.append(det.text)
-        return threads
-    
-    async def _run_gemini_with_locations(
-        self, 
-        image_bytes: bytes
-    ) -> List[GeminiDimension]:
-        """Run Gemini and get dimensions with approximate locations."""
-        if not self.vision_service:
-            return []
-        
-        try:
-            result = await self.vision_service.identify_dimensions_with_locations(image_bytes)
-            return [
-                GeminiDimension(
-                    value=d['value'],
-                    x_percent=d.get('x', 50),
-                    y_percent=d.get('y', 50),
-                    confidence=d.get('confidence', 0.8)
-                )
-                for d in result
-            ]
-        except Exception as e:
-            print(f"Gemini with locations error: {e}")
-            try:
-                dims = await self.vision_service.identify_dimensions(image_bytes)
-                return [
-                    GeminiDimension(value=d, x_percent=50, y_percent=50, confidence=0.7)
-                    for d in dims
-                ]
-            except Exception as e2:
-                print(f"Gemini fallback error: {e2}")
-                return []
-    
-    def _match_dimensions_smart(
+    def _match_by_location(
         self,
         grouped_ocr: List[OCRDetection],
         raw_ocr: List[OCRDetection],
-        gemini_dims: List[GeminiDimension],
-        thread_callouts: List[str]
+        gemini_dims: List[GeminiDimension]
     ) -> List[Dimension]:
-        """Smart matching algorithm."""
+        """
+        Match Gemini dimensions to OCR using LOCATION as primary factor.
+        This prevents the wrong bounding box being used.
+        """
         matched = []
-        used_ocr = set()
+        used_ocr_ids = set()
         
-        gemini_values = {self._normalize(g.value) for g in gemini_dims}
-        for thread in thread_callouts:
-            if self._normalize(thread) not in gemini_values:
-                gemini_dims.append(GeminiDimension(
-                    value=thread, x_percent=50, y_percent=50, confidence=0.6
-                ))
-        
-        for gem_dim in gemini_dims:
-            result = self._find_best_match(
-                gem_dim, grouped_ocr, raw_ocr, used_ocr
-            )
+        for gem in gemini_dims:
+            # Convert Gemini's percentage to normalized coords (0-1000)
+            target_x = gem.x_percent * 10
+            target_y = gem.y_percent * 10
             
-            if result:
-                ocr_det, confidence = result
-                used_ocr.add(id(ocr_det))
+            # Find best OCR match by LOCATION first, then text similarity
+            best_match = None
+            best_score = 0
+            
+            for ocr in grouped_ocr:
+                if id(ocr) in used_ocr_ids:
+                    continue
                 
+                box = ocr.bounding_box
+                ocr_x = (box["xmin"] + box["xmax"]) / 2
+                ocr_y = (box["ymin"] + box["ymax"]) / 2
+                
+                # Location score (closer = higher)
+                distance = ((ocr_x - target_x) ** 2 + (ocr_y - target_y) ** 2) ** 0.5
+                max_dist = 300  # Max acceptable distance
+                location_score = max(0, 1 - (distance / max_dist))
+                
+                # Text similarity score
+                text_score = self._text_similarity(gem.value, ocr.text)
+                
+                # Combined score - location weighted higher
+                combined = (location_score * 0.6) + (text_score * 0.4)
+                
+                if combined > best_score and combined > 0.3:
+                    best_score = combined
+                    best_match = ocr
+            
+            # If no grouped match, try combining raw OCR
+            if not best_match or best_score < 0.5:
+                combined_match = self._try_combine_nearby(
+                    gem, raw_ocr, target_x, target_y, used_ocr_ids
+                )
+                if combined_match:
+                    best_match = combined_match
+                    best_score = 0.7
+            
+            if best_match:
+                used_ocr_ids.add(id(best_match))
                 matched.append(Dimension(
                     id=0,
-                    value=gem_dim.value,
+                    value=gem.value,
                     zone=None,
-                    bounding_box=BoundingBox(**ocr_det.bounding_box),
-                    confidence=confidence,
+                    bounding_box=BoundingBox(**best_match.bounding_box),
+                    confidence=best_score,
                     page=1
                 ))
         
         return matched
     
-    def _find_best_match(
-        self,
-        gem_dim: GeminiDimension,
-        grouped_ocr: List[OCRDetection],
-        raw_ocr: List[OCRDetection],
-        used: set
-    ) -> Optional[Tuple[OCRDetection, float]]:
-        """Find best OCR match for a Gemini dimension."""
+    def _text_similarity(self, s1: str, s2: str) -> float:
+        """Calculate text similarity."""
+        n1 = self._normalize(s1)
+        n2 = self._normalize(s2)
         
-        normalized_gem = self._normalize(gem_dim.value)
+        if n1 == n2:
+            return 1.0
+        if n1 in n2 or n2 in n1:
+            return 0.8
         
-        # Strategy 1: Exact match
-        for ocr in grouped_ocr:
-            if id(ocr) in used:
-                continue
-            if self._normalize(ocr.text) == normalized_gem:
-                return (ocr, 1.0)
-        
-        # Strategy 2: Partial/fuzzy match
-        best_partial = None
-        best_partial_score = 0.5
-        
-        for ocr in grouped_ocr:
-            if id(ocr) in used:
-                continue
-            
-            norm_ocr = self._normalize(ocr.text)
-            
-            if normalized_gem in norm_ocr or norm_ocr in normalized_gem:
-                if len(norm_ocr) > 0 and len(normalized_gem) > 0:
-                    score = min(len(normalized_gem), len(norm_ocr)) / max(len(normalized_gem), len(norm_ocr))
-                    if score > best_partial_score:
-                        best_partial = ocr
-                        best_partial_score = score
-            
-            fuzzy_score = SequenceMatcher(None, normalized_gem, norm_ocr).ratio()
-            if fuzzy_score > best_partial_score:
-                best_partial = ocr
-                best_partial_score = fuzzy_score
-        
-        if best_partial and best_partial_score > 0.6:
-            return (best_partial, best_partial_score)
-        
-        # Strategy 3: Combine raw OCR tokens
-        combined = self._try_combine_raw_ocr(gem_dim.value, raw_ocr, used)
-        if combined:
-            return combined
-        
-        # Strategy 4: Location-based
-        if gem_dim.x_percent != 50 or gem_dim.y_percent != 50:
-            location_match = self._find_by_location(gem_dim, grouped_ocr, used)
-            if location_match:
-                return location_match
-        
-        return None
+        return SequenceMatcher(None, n1, n2).ratio()
     
-    def _try_combine_raw_ocr(
+    def _normalize(self, text: str) -> str:
+        """Normalize for comparison."""
+        if not text:
+            return ""
+        n = text.lower()
+        for old, new in [('ø', 'o'), ('"', ''), ("'", ''), (' ', ''), ('–', '-')]:
+            n = n.replace(old, new)
+        return re.sub(r'[^\w.\-+/]', '', n)
+    
+    def _try_combine_nearby(
         self,
-        target: str,
+        gem: GeminiDimension,
         raw_ocr: List[OCRDetection],
+        target_x: float,
+        target_y: float,
         used: set
-    ) -> Optional[Tuple[OCRDetection, float]]:
-        """Try to combine raw OCR tokens that form the target."""
+    ) -> Optional[OCRDetection]:
+        """Try to combine raw OCR tokens near the target location."""
         
-        normalized_target = self._normalize(target)
-        
-        candidates = []
+        # Find tokens near target location
+        nearby = []
         for ocr in raw_ocr:
             if id(ocr) in used:
                 continue
-            norm_ocr = self._normalize(ocr.text)
-            if norm_ocr and len(norm_ocr) >= 1 and norm_ocr in normalized_target:
-                candidates.append(ocr)
-        
-        if len(candidates) < 2:
-            return None
-        
-        candidates.sort(key=lambda d: (d.bounding_box["ymin"], d.bounding_box["xmin"]))
-        
-        # Check spatial proximity
-        max_gap = 100
-        filtered = [candidates[0]]
-        for c in candidates[1:]:
-            prev = filtered[-1]
-            x_gap = abs(c.bounding_box["xmin"] - prev.bounding_box["xmax"])
-            y_gap = abs(c.bounding_box["ymin"] - prev.bounding_box["ymin"])
-            if x_gap < max_gap and y_gap < 50:
-                filtered.append(c)
-        
-        if len(filtered) < 2:
-            return None
-        
-        combined_text = " ".join(c.text for c in filtered)
-        combined_norm = self._normalize(combined_text)
-        
-        similarity = SequenceMatcher(None, normalized_target, combined_norm).ratio()
-        
-        if similarity > 0.6:
-            combined_box = {
-                "xmin": min(c.bounding_box["xmin"] for c in filtered),
-                "xmax": max(c.bounding_box["xmax"] for c in filtered),
-                "ymin": min(c.bounding_box["ymin"] for c in filtered),
-                "ymax": max(c.bounding_box["ymax"] for c in filtered),
-            }
-            
-            combined_det = OCRDetection(
-                text=combined_text,
-                bounding_box=combined_box,
-                confidence=sum(c.confidence for c in filtered) / len(filtered)
-            )
-            
-            for c in filtered:
-                used.add(id(c))
-            
-            return (combined_det, similarity)
-        
-        return None
-    
-    def _find_by_location(
-        self,
-        gem_dim: GeminiDimension,
-        ocr_list: List[OCRDetection],
-        used: set
-    ) -> Optional[Tuple[OCRDetection, float]]:
-        """Find OCR match based on location hint."""
-        
-        target_x = gem_dim.x_percent * 10
-        target_y = gem_dim.y_percent * 10
-        
-        best_match = None
-        best_distance = float('inf')
-        
-        for ocr in ocr_list:
-            if id(ocr) in used:
-                continue
-            
-            if not PATTERNS.is_dimension_text(ocr.text):
-                continue
             
             box = ocr.bounding_box
-            center_x = (box["xmin"] + box["xmax"]) / 2
-            center_y = (box["ymin"] + box["ymax"]) / 2
+            cx = (box["xmin"] + box["xmax"]) / 2
+            cy = (box["ymin"] + box["ymax"]) / 2
             
-            distance = ((center_x - target_x) ** 2 + (center_y - target_y) ** 2) ** 0.5
-            
-            if distance < best_distance and distance < 200:
-                best_distance = distance
-                best_match = ocr
+            dist = ((cx - target_x) ** 2 + (cy - target_y) ** 2) ** 0.5
+            if dist < 150:  # Within range
+                nearby.append((ocr, dist))
         
-        if best_match:
-            confidence = max(0.5, 1.0 - (best_distance / 200))
-            return (best_match, confidence)
+        if not nearby:
+            return None
+        
+        # Sort by distance
+        nearby.sort(key=lambda x: x[1])
+        
+        # Take closest few and check if they form the target
+        candidates = [n[0] for n in nearby[:6]]
+        
+        # Try to match
+        target_norm = self._normalize(gem.value)
+        
+        for size in range(len(candidates), 0, -1):
+            for combo in self._combinations(candidates, size):
+                combo_sorted = sorted(combo, key=lambda d: (d.bounding_box["ymin"], d.bounding_box["xmin"]))
+                combo_text = " ".join(d.text for d in combo_sorted)
+                combo_norm = self._normalize(combo_text)
+                
+                similarity = SequenceMatcher(None, target_norm, combo_norm).ratio()
+                if similarity > 0.7:
+                    # Create merged detection
+                    return OCRDetection(
+                        text=combo_text,
+                        bounding_box={
+                            "xmin": min(d.bounding_box["xmin"] for d in combo_sorted),
+                            "xmax": max(d.bounding_box["xmax"] for d in combo_sorted),
+                            "ymin": min(d.bounding_box["ymin"] for d in combo_sorted),
+                            "ymax": max(d.bounding_box["ymax"] for d in combo_sorted),
+                        },
+                        confidence=0.7
+                    )
         
         return None
     
-    def _normalize(self, text: str) -> str:
-        """Normalize text for comparison."""
-        if not text:
-            return ""
-        
-        normalized = text.lower()
-        
-        replacements = {
-            "ø": "o", "⌀": "o", "°": "", "±": "+-", 
-            '"': '', "'": '', "″": "", "′": "",
-            " ": "", ",": ".", "–": "-", "—": "-"
-        }
-        for old, new in replacements.items():
-            normalized = normalized.replace(old, new)
-        
-        normalized = re.sub(r'[^\w.\-+/]', '', normalized)
-        
-        return normalized
+    def _combinations(self, items: list, size: int):
+        """Generate combinations."""
+        if size == 0:
+            yield []
+        elif items:
+            for i, item in enumerate(items):
+                for combo in self._combinations(items[i+1:], size-1):
+                    yield [item] + combo
     
-    def _calculate_zone(
-        self, 
-        center_x: float, 
-        center_y: float,
-        grid: Optional[Dict[str, List[str]]] = None
-    ) -> str:
-        """Calculate grid zone for a point."""
-        columns = grid['columns'] if grid else self.STANDARD_GRID_COLUMNS
-        rows = grid['rows'] if grid else self.STANDARD_GRID_ROWS
+    def _calculate_zone(self, center_x: float, center_y: float) -> str:
+        """Calculate grid zone."""
+        cols = self.STANDARD_GRID_COLUMNS
+        rows = self.STANDARD_GRID_ROWS
         
-        num_cols = len(columns)
-        col_width = 1000 / num_cols
-        col_idx = min(int(center_x / col_width), num_cols - 1)
+        col_idx = min(int(center_x / (1000 / len(cols))), len(cols) - 1)
+        row_idx = min(int(center_y / (1000 / len(rows))), len(rows) - 1)
         
-        num_rows = len(rows)
-        row_height = 1000 / num_rows
-        row_idx = min(int(center_y / row_height), num_rows - 1)
-        
-        column_label = columns[col_idx] if col_idx < len(columns) else '?'
-        row_label = rows[row_idx] if row_idx < len(rows) else '?'
-        
-        return f"{column_label}{row_label}"
+        return f"{cols[col_idx]}{rows[row_idx]}"
     
-    def _sort_reading_order(self, dimensions: List[Dimension]) -> List[Dimension]:
-        """Sort dimensions in reading order."""
-        if not dimensions:
+    def _sort_reading_order(self, dims: List[Dimension]) -> List[Dimension]:
+        """Sort in reading order."""
+        if not dims:
             return []
         
-        band_height = 100
-        
-        def get_band(dim: Dimension) -> int:
-            return int(dim.bounding_box.center_y) // band_height
-        
+        band = 100
         return sorted(
-            dimensions,
-            key=lambda d: (get_band(d), d.bounding_box.center_x)
+            dims,
+            key=lambda d: (int(d.bounding_box.center_y) // band, d.bounding_box.center_x)
         )
 
 
@@ -710,23 +654,20 @@ def create_detection_service(
     ocr_api_key: Optional[str] = None,
     gemini_api_key: Optional[str] = None
 ) -> DetectionService:
-    """Factory function to create detection service."""
-    ocr_service = None
-    vision_service = None
+    """Create detection service."""
+    ocr = None
+    vision = None
     
-    try:
-        if ocr_api_key:
-            ocr_service = create_ocr_service(ocr_api_key)
-    except ValueError:
-        pass
+    if ocr_api_key:
+        try:
+            ocr = create_ocr_service(ocr_api_key)
+        except:
+            pass
     
-    try:
-        if gemini_api_key:
-            vision_service = create_vision_service(gemini_api_key)
-    except ValueError:
-        pass
+    if gemini_api_key:
+        try:
+            vision = create_vision_service(gemini_api_key)
+        except:
+            pass
     
-    return DetectionService(
-        ocr_service=ocr_service,
-        vision_service=vision_service
-    )
+    return DetectionService(ocr_service=ocr, vision_service=vision)
