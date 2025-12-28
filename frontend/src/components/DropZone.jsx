@@ -585,26 +585,7 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
   }, [drawMode, showValueInput]);
   
   // ===== Rectangle Drawing Handlers =====
-  const handleMouseDown = (e) => {
-    if (!drawMode || !containerRef.current) return;
-    e.preventDefault();
-    e.stopPropagation();
-    const rect = containerRef.current.getBoundingClientRect();
-    const x = ((e.clientX - rect.left) / rect.width) * 100;
-    const y = ((e.clientY - rect.top) / rect.height) * 100;
-    setIsDrawing(true);
-    setDrawStart({ x, y });
-    setDrawEnd({ x, y });
-  };
-  
-  const handleMouseMove = (e) => {
-    if (!isDrawing || !containerRef.current) return;
-    const rect = containerRef.current.getBoundingClientRect();
-    const x = Math.max(0, Math.min(100, ((e.clientX - rect.left) / rect.width) * 100));
-    const y = Math.max(0, Math.min(100, ((e.clientY - rect.top) / rect.height) * 100));
-    setDrawEnd({ x, y });
-  };
-    
+  // Updated handleMouseUp with "Smart Click" logic
   const handleMouseUp = async () => {
     if (!isDrawing || !drawStart || !drawEnd) {
       setIsDrawing(false);
@@ -612,21 +593,51 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
     }
     setIsDrawing(false);
     
-    const minX = Math.min(drawStart.x, drawEnd.x);
-    const maxX = Math.max(drawStart.x, drawEnd.x);
-    const minY = Math.min(drawStart.y, drawEnd.y);
-    const maxY = Math.max(drawStart.y, drawEnd.y);
+    // Calculate how far the mouse moved
+    const dist = Math.sqrt(
+      Math.pow(drawEnd.x - drawStart.x, 2) + 
+      Math.pow(drawEnd.y - drawStart.y, 2)
+    );
     
-    // Minimum size check (at least 1% of container)
-    if (maxX - minX < 1 || maxY - minY < 1) {
-      setDrawStart(null);
-      setDrawEnd(null);
-      return;
+    let finalMinX, finalMaxX, finalMinY, finalMaxY;
+
+    // === SMART CLICK LOGIC ===
+    // If movement is very small (< 1%), treat it as a CLICK, not a box draw
+    if (dist < 1) {
+      if (drawMode === 'addBalloon') {
+        // Define a "Default Search Box" around the click
+        // 8% width / 4% height is a good heuristic for a typical dimension label
+        const defaultW = 8; 
+        const defaultH = 4;
+        
+        finalMinX = Math.max(0, drawStart.x - (defaultW / 2));
+        finalMaxX = Math.min(100, drawStart.x + (defaultW / 2));
+        finalMinY = Math.max(0, drawStart.y - (defaultH / 2));
+        finalMaxY = Math.min(100, drawStart.y + (defaultH / 2));
+      } else {
+        // For clearing, a click effectively does nothing (safety)
+        setDrawStart(null);
+        setDrawEnd(null);
+        return;
+      }
+    } else {
+      // Normal "Draw a Box" logic
+      finalMinX = Math.min(drawStart.x, drawEnd.x);
+      finalMaxX = Math.max(drawStart.x, drawEnd.x);
+      finalMinY = Math.min(drawStart.y, drawEnd.y);
+      finalMaxY = Math.max(drawStart.y, drawEnd.y);
+      
+      // Ignore tiny accidental drags that aren't clicks
+      if (finalMaxX - finalMinX < 0.5 || finalMaxY - finalMinY < 0.5) {
+        setDrawStart(null);
+        setDrawEnd(null);
+        return;
+      }
     }
     
     if (drawMode === 'addBalloon') {
-      // Save the rectangle and show value input
-      setNewBalloonRect({ minX, maxX, minY, maxY });
+      // Set the rectangle visually
+      setNewBalloonRect({ minX: finalMinX, maxX: finalMaxX, minY: finalMinY, maxY: finalMaxY });
       setNewBalloonValue('');
       setDetectionError(null);
       setIsDetecting(true);
@@ -635,14 +646,15 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
       setDrawStart(null);
       setDrawEnd(null);
       
-      // Auto-detect dimension value via OCR (with small delay for state to update)
+      // Trigger detection with the calculated box
       setTimeout(() => {
-        detectTextInRegion(minX, maxX, minY, maxY);
+        detectTextInRegion(finalMinX, finalMaxX, finalMinY, finalMaxY);
       }, 50);
+      
     } else if (drawMode === 'clearArea') {
-      // Delete all balloons inside the rectangle
+      // Clear area logic remains the same (requires a box)
       setDimensions(prev => prev.filter(d => {
-        const isInside = d.balloonX >= minX && d.balloonX <= maxX && d.balloonY >= minY && d.balloonY <= maxY;
+        const isInside = d.balloonX >= finalMinX && d.balloonX <= finalMaxX && d.balloonY >= finalMinY && d.balloonY <= finalMaxY;
         return !isInside;
       }));
       setDrawMode(null);
@@ -683,15 +695,19 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
       const cropW = ((maxX - minX) / 100) * imgWidth;
       const cropH = ((maxY - minY) / 100) * imgHeight;
       
-      // Add padding (10%) and ROUND TO INTEGERS to fix the 422 Error
-      const padding = Math.max(cropW, cropH) * 0.1;
+      // === IMPROVED PADDING STRATEGY ===
+      // Previous: 10% relative padding.
+      // New: Max of (20% relative OR 30px absolute). 
+      // This ensures even small tight boxes get enough context for OCR to work.
+      const paddingX = Math.max(cropW * 0.2, 30);
+      const paddingY = Math.max(cropH * 0.2, 30);
       
-      const finalX = Math.max(0, cropX - padding);
-      const finalY = Math.max(0, cropY - padding);
+      const finalX = Math.max(0, cropX - paddingX);
+      const finalY = Math.max(0, cropY - paddingY);
       
-      // FIXED: Wrap in Math.round() to ensure integers
-      const finalW = Math.round(Math.min(imgWidth - finalX, cropW + padding * 2));
-      const finalH = Math.round(Math.min(imgHeight - finalY, cropH + padding * 2));
+      // Round to integers to prevent 422 Error
+      const finalW = Math.round(Math.min(imgWidth - finalX, cropW + paddingX * 2));
+      const finalH = Math.round(Math.min(imgHeight - finalY, cropH + paddingY * 2));
       
       canvas.width = finalW;
       canvas.height = finalH;
@@ -714,7 +730,7 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 30000);
       
-      // Send to backend
+      // Send to backend for OCR
       try {
         const response = await fetch(`${API_BASE_URL}/detect-region`, {
           method: 'POST',
@@ -724,8 +740,8 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
           },
           body: JSON.stringify({
             image: croppedBase64,
-            width: finalW,  // Now correctly sending an Integer
-            height: finalH  // Now correctly sending an Integer
+            width: finalW,
+            height: finalH
           }),
           signal: controller.signal
         });
@@ -734,7 +750,6 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
         
         if (response.ok) {
           const data = await response.json();
-          
           if (data.success && data.detected_text) {
             setNewBalloonValue(data.detected_text);
           } else if (data.dimensions && data.dimensions.length > 0) {
@@ -744,7 +759,6 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
             setDetectionError('No text detected. Enter value manually.');
           }
         } else {
-          // Log the actual error text for easier debugging
           const errorText = await response.text();
           console.error('[AddBalloon] Request failed:', response.status, errorText);
           setDetectionError('Auto-detect unavailable. Enter value manually.');
