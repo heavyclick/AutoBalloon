@@ -660,6 +660,9 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
       return;
     }
     
+    // Log the attempt
+    console.log('[AddBalloon] Sending request to:', `${API_BASE_URL}/detect-region`);
+
     try {
       const img = imageRef.current;
       
@@ -704,42 +707,64 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
         return;
       }
       
-      // Send to backend for OCR
-      const response = await fetch(`${API_BASE_URL}/detect-region`, {
-        method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          ...(token && { 'Authorization': `Bearer ${token}` })
-        },
-        body: JSON.stringify({
-          image: croppedBase64,
-          width: finalW,
-          height: finalH
-        })
-      });
+      // Setup timeout controller (30 seconds)
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 30000);
       
-      if (response.ok) {
-        const data = await response.json();
-        if (data.success && data.detected_text) {
-          setNewBalloonValue(data.detected_text);
-        } else if (data.dimensions && data.dimensions.length > 0) {
-          // Fallback for different API response structure
-          const val = data.dimensions[0].value || data.dimensions[0];
-          setNewBalloonValue(val);
+      // Send to backend for OCR
+      try {
+        const response = await fetch(`${API_BASE_URL}/detect-region`, {
+          method: 'POST',
+          headers: { 
+            'Content-Type': 'application/json',
+            ...(token && { 'Authorization': `Bearer ${token}` })
+          },
+          body: JSON.stringify({
+            image: croppedBase64,
+            width: finalW,
+            height: finalH
+          }),
+          signal: controller.signal
+        });
+        
+        clearTimeout(timeoutId);
+        console.log('[AddBalloon] Response status:', response.status);
+        
+        if (response.ok) {
+          const data = await response.json();
+          console.log('[AddBalloon] Response data:', data);
+
+          if (data.success && data.detected_text) {
+            setNewBalloonValue(data.detected_text);
+          } else if (data.dimensions && data.dimensions.length > 0) {
+            // Fallback for different API response structure
+            const val = data.dimensions[0].value || data.dimensions[0];
+            setNewBalloonValue(val);
+          } else {
+            setDetectionError('No text detected. Enter value manually.');
+          }
         } else {
-          setDetectionError('No text detected. Enter value manually.');
+          const errorText = await response.text();
+          console.error('[AddBalloon] Request failed:', response.status, errorText);
+          setDetectionError('Auto-detect unavailable. Enter value manually.');
         }
-      } else {
-        setDetectionError('Auto-detect unavailable. Enter value manually.');
+      } catch (fetchError) {
+        clearTimeout(timeoutId);
+        if (fetchError.name === 'AbortError') {
+          console.error('[AddBalloon] Request timed out');
+          setDetectionError('Detection timed out. Enter value manually.');
+        } else {
+          console.error('[AddBalloon] Fetch error:', fetchError);
+          setDetectionError('Connection error. Enter value manually.');
+        }
       }
     } catch (err) {
-      console.error('Region detection failed:', err);
+      console.error('[AddBalloon] Unexpected error:', err);
       setDetectionError('Detection failed. Enter value manually.');
     } finally {
       setIsDetecting(false);
     }
   };
-
   
   // Add balloon confirmation
   const handleAddBalloonConfirm = () => {
