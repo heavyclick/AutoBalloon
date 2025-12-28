@@ -34,20 +34,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Import and include routers
+# =============================================================================
+# ROUTER IMPORTS
+# =============================================================================
 from api.routes import router as main_router
 from api.auth_routes import router as auth_router
-# CHANGED: Now using v2 routes for LemonSqueezy multi-product support
+# Use V2 for Multi-Product Support (Pass, Monthly, Yearly)
 from api.payment_routes_v2 import router as payment_router
 from api.usage_routes import router as usage_router
 from api.download_routes import router as download_router
+from api.guest_session_routes import router as guest_session_router
 from api.detect_region import detect_region, RegionDetectRequest
 
+# =============================================================================
+# INCLUDE ROUTERS
+# =============================================================================
 app.include_router(main_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 app.include_router(payment_router, prefix="/api")
 app.include_router(usage_router, prefix="/api")
-app.include_router(download_router)
+app.include_router(download_router) # download_routes usually has its own prefix or root
+app.include_router(guest_session_router, prefix="/api")
 
 
 # =============================================================================
