@@ -17,6 +17,9 @@ from models.schemas import (
     ExportMetadata,
 )
 
+# FIX: Import the export service
+from services.export_service import export_service
+
 
 router = APIRouter()  # NO PREFIX - endpoints registered at root, main.py handles routing
 
