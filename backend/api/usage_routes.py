@@ -6,7 +6,8 @@ from typing import Optional
 from datetime import datetime
 import os
 
-router = APIRouter(prefix="/api/usage", tags=["usage"])
+# CHANGED: Prefix is now "/usage" because main.py mounts it under "/api"
+router = APIRouter(prefix="/usage", tags=["usage"])
 
 from supabase import create_client, Client
 
