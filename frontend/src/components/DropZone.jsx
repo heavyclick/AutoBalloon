@@ -604,7 +604,7 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
     const y = Math.max(0, Math.min(100, ((e.clientY - rect.top) / rect.height) * 100));
     setDrawEnd({ x, y });
   };
-  
+    
   const handleMouseUp = async () => {
     if (!isDrawing || !drawStart || !drawEnd) {
       setIsDrawing(false);
@@ -627,12 +627,18 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
     if (drawMode === 'addBalloon') {
       // Save the rectangle and show value input
       setNewBalloonRect({ minX, maxX, minY, maxY });
+      setNewBalloonValue('');
+      setDetectionError(null);
+      setIsDetecting(true);
       setShowValueInput(true);
       setDrawMode(null);
-      setDetectionError(null);
+      setDrawStart(null);
+      setDrawEnd(null);
       
-      // Auto-detect dimension value via OCR
-      detectTextInRegion(minX, maxX, minY, maxY);
+      // Auto-detect dimension value via OCR (with small delay for state to update)
+      setTimeout(() => {
+        detectTextInRegion(minX, maxX, minY, maxY);
+      }, 50);
     } else if (drawMode === 'clearArea') {
       // Delete all balloons inside the rectangle
       setDimensions(prev => prev.filter(d => {
@@ -646,16 +652,24 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
     setDrawEnd(null);
   };
   
-  // ===== OCR Detection for drawn region =====
+// ===== REPLACE YOUR detectTextInRegion (around line 439-478) WITH THIS =====
+  
   const detectTextInRegion = async (minX, maxX, minY, maxY) => {
-    if (!imageRef.current) return;
-    
-    setIsDetecting(true);
-    setDetectionError(null);
+    if (!imageRef.current) {
+      setDetectionError('Image not loaded. Enter value manually.');
+      setIsDetecting(false);
+      return;
+    }
     
     try {
-      // Create canvas and crop the region
       const img = imageRef.current;
+      
+      if (!img.naturalWidth || !img.naturalHeight) {
+        setDetectionError('Image not ready. Enter value manually.');
+        setIsDetecting(false);
+        return;
+      }
+      
       const canvas = document.createElement('canvas');
       const ctx = canvas.getContext('2d');
       
@@ -681,7 +695,14 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
       ctx.drawImage(img, finalX, finalY, finalW, finalH, 0, 0, finalW, finalH);
       
       // Convert to base64
-      const croppedBase64 = canvas.toDataURL('image/png').split(',')[1];
+      let croppedBase64;
+      try {
+        croppedBase64 = canvas.toDataURL('image/png').split(',')[1];
+      } catch (e) {
+        setDetectionError('Image security error. Enter value manually.');
+        setIsDetecting(false);
+        return;
+      }
       
       // Send to backend for OCR
       const response = await fetch(`${API_BASE_URL}/detect-region`, {
@@ -702,13 +723,11 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
         if (data.success && data.detected_text) {
           setNewBalloonValue(data.detected_text);
         } else if (data.dimensions && data.dimensions.length > 0) {
-          // If it returns dimensions array, use the first one
           setNewBalloonValue(data.dimensions[0].value || data.dimensions[0]);
         } else {
-          setDetectionError('No text detected. Enter value manually.');
+          setDetectionError(data.error || 'No text detected. Enter value manually.');
         }
       } else {
-        // Endpoint might not exist yet, allow manual entry
         setDetectionError('Auto-detect unavailable. Enter value manually.');
       }
     } catch (err) {
@@ -718,6 +737,69 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
       setIsDetecting(false);
     }
   };
+    
+    console.log('[AddBalloon] Sending request to:', `${API_BASE_URL}/detect-region`);
+    
+    // Add timeout with AbortController
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+    
+    try {
+      const response = await fetch(`${API_BASE_URL}/detect-region`, {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          ...(token && { 'Authorization': `Bearer ${token}` })
+        },
+        body: JSON.stringify(requestBody),
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+      
+      console.log('[AddBalloon] Response status:', response.status);
+      
+      if (response.ok) {
+        const data = await response.json();
+        console.log('[AddBalloon] Response data:', data);
+        
+        if (data.success && data.detected_text) {
+          setNewBalloonValue(data.detected_text);
+          console.log('[AddBalloon] Detection successful:', data.detected_text);
+        } else if (data.dimensions && data.dimensions.length > 0) {
+          // If it returns dimensions array, use the first one
+          const value = data.dimensions[0].value || data.dimensions[0];
+          setNewBalloonValue(value);
+          console.log('[AddBalloon] Detection from dimensions:', value);
+        } else {
+          console.warn('[AddBalloon] No text in response:', data);
+          setDetectionError(data.error || 'No text detected. Enter value manually.');
+        }
+      } else {
+        const errorText = await response.text();
+        console.error('[AddBalloon] Request failed:', response.status, errorText);
+        setDetectionError(`Detection failed (${response.status}). Enter value manually.`);
+      }
+    } catch (fetchError) {
+      clearTimeout(timeoutId);
+      
+      if (fetchError.name === 'AbortError') {
+        console.error('[AddBalloon] Request timed out');
+        setDetectionError('Detection timed out. Enter value manually.');
+      } else {
+        console.error('[AddBalloon] Fetch error:', fetchError);
+        setDetectionError('Connection error. Enter value manually.');
+      }
+    }
+    
+  } catch (err) {
+    console.error('[AddBalloon] Unexpected error:', err);
+    setDetectionError('Detection failed. Enter value manually.');
+  } finally {
+    setIsDetecting(false);
+  }
+};
+
   
   // Add balloon confirmation
   const handleAddBalloonConfirm = () => {
