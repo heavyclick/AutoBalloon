@@ -1,6 +1,9 @@
 /**
- * PaymentSuccess Page - Fixed
- * Provides explicit download options (PDF, Excel, ZIP) instead of auto-downloading just one.
+ * PaymentSuccess Page - Auto-Login & Smart Download
+ * Handles post-payment flow:
+ * 1. Exchanges session_id for login token (auto-login)
+ * 2. Auto-downloads the requested file (ZIP/PDF/Excel)
+ * 3. Redirects to dashboard with Pro access
  */
 
 import React, { useEffect, useState } from 'react';
@@ -12,34 +15,61 @@ import { API_BASE_URL } from '../constants/config';
 export function PaymentSuccessPage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const { refreshUser } = useAuth();
+  const { login } = useAuth();
   const { sessionData, clearSession } = useGuestSession();
   
-  const [status, setStatus] = useState('verifying'); // 'verifying', 'success', 'error'
+  const [status, setStatus] = useState('verifying'); // 'verifying', 'success', 'downloading', 'error'
   const [restoredData, setRestoredData] = useState(null);
   const [error, setError] = useState(null);
   const [isDownloading, setIsDownloading] = useState(false);
+  const [message, setMessage] = useState('Verifying your payment...');
 
   const sessionId = searchParams.get('session_id');
 
   useEffect(() => {
-    handlePaymentSuccess();
-  }, []);
+    if (sessionId) {
+      handlePostPaymentFlow();
+    } else {
+      setError('No session ID found.');
+      setStatus('error');
+    }
+  }, [sessionId]);
 
-  const handlePaymentSuccess = async () => {
+  const handlePostPaymentFlow = async () => {
     try {
-      // 1. Refresh user
-      await refreshUser();
-      
-      // 2. Restore Session Data (Local or Backend)
+      // 1. Auto-Login: Exchange Session ID for JWT
+      setMessage('Activating your account...');
+      try {
+        const authRes = await fetch(`${API_BASE_URL}/auth/exchange-session`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: sessionId })
+        });
+        
+        if (authRes.ok) {
+          const authData = await authRes.json();
+          // Log user in immediately!
+          login(authData.access_token, authData.user);
+          console.log("Auto-login successful");
+        } else {
+          console.warn("Auto-login skipped: Session not yet confirmed paid via webhook");
+        }
+      } catch (e) {
+        console.warn("Auto-login error:", e);
+      }
+
+      // 2. Restore Data for Download
+      setMessage('Preparing your files...');
       let data = sessionData;
+      
       if (!data) {
+        // Try localStorage backup
         const local = localStorage.getItem('autoballoon_guest_session_data');
         if (local) data = JSON.parse(local);
       }
       
       if (!data && sessionId) {
-        // Fetch from backend if not local
+        // Try fetching from backend
         const res = await fetch(`${API_BASE_URL}/guest-session/retrieve/${sessionId}`);
         const json = await res.json();
         if (json.success && json.data) data = json.data;
@@ -48,10 +78,27 @@ export function PaymentSuccessPage() {
       if (data) {
         setRestoredData(data);
         setStatus('success');
-        // Clear session now that we have data in state
+        
+        // 3. Auto-Download based on Preference
+        const pref = localStorage.getItem('autoballoon_download_preference') || 'zip';
+        setMessage(`Starting ${pref.toUpperCase()} download...`);
+        
+        // Trigger download automatically
+        await handleDownload(pref, data);
+        
+        // Clear guest session
         clearSession();
+        
+        // 4. Redirect after delay
+        setTimeout(() => {
+          navigate('/');
+        }, 5000);
+        
       } else {
-        setStatus('success'); // Still success, just no data to download immediately
+        // Payment valid, but data gone (rare)
+        setStatus('success');
+        setMessage('Payment successful! Redirecting to dashboard...');
+        setTimeout(() => navigate('/'), 3000);
       }
       
     } catch (err) {
@@ -61,27 +108,29 @@ export function PaymentSuccessPage() {
     }
   };
 
-  const handleDownload = async (type) => {
-    if (!restoredData) return;
+  const handleDownload = async (type, dataOverride = null) => {
+    const data = dataOverride || restoredData;
+    if (!data) return;
+    
     setIsDownloading(true);
 
     try {
-      let endpoint = '/export'; // Default Excel
+      let endpoint = '/export'; // Default
       let payload = {};
-      let filename = restoredData.filename || 'inspection';
+      let filename = data.filename || 'inspection';
 
       if (type === 'pdf') {
         endpoint = '/download/pdf';
         filename += '_ballooned.pdf';
         payload = {
-          pages: restoredData.pages || [], // Required for PDF
+          pages: data.pages || [],
           part_name: filename
         };
       } else if (type === 'zip') {
         endpoint = '/download/zip';
         filename += '_bundle.zip';
         payload = {
-          pages: restoredData.pages || [], // Required for ZIP
+          pages: data.pages || [],
           grid_detected: true
         };
       } else {
@@ -91,8 +140,8 @@ export function PaymentSuccessPage() {
         payload = {
           format: 'xlsx',
           template: 'AS9102_FORM3',
-          dimensions: restoredData.dimensions,
-          total_pages: restoredData.totalPages || 1,
+          dimensions: data.dimensions,
+          total_pages: data.totalPages || 1,
           grid_detected: true
         };
       }
@@ -114,11 +163,10 @@ export function PaymentSuccessPage() {
         document.body.removeChild(a);
         window.URL.revokeObjectURL(url);
       } else {
-        alert("Download failed. Please try again.");
+        console.error("Download failed status:", response.status);
       }
     } catch (e) {
-      console.error(e);
-      alert("Download error.");
+      console.error("Download exception:", e);
     } finally {
       setIsDownloading(false);
     }
@@ -131,7 +179,8 @@ export function PaymentSuccessPage() {
         {status === 'verifying' && (
           <div className="py-8">
             <div className="w-12 h-12 mx-auto mb-4 border-4 border-[#E63946] border-t-transparent rounded-full animate-spin"></div>
-            <h2 className="text-xl font-bold text-white">Verifying Payment...</h2>
+            <h2 className="text-xl font-bold text-white">Processing...</h2>
+            <p className="text-gray-400 mt-2">{message}</p>
           </div>
         )}
 
@@ -145,12 +194,12 @@ export function PaymentSuccessPage() {
             
             <h1 className="text-2xl font-bold text-white mb-2">Payment Successful!</h1>
             <p className="text-gray-400 mb-6">
-              Your account has been upgraded. Check your email for a login link.
+              Your account is active. {restoredData ? "Your download should start automatically." : ""}
             </p>
 
             {restoredData ? (
               <div className="space-y-3">
-                <p className="text-sm text-gray-500 uppercase tracking-wider font-bold mb-3">Download Your Files</p>
+                <p className="text-sm text-gray-500 uppercase tracking-wider font-bold mb-3">Download Again</p>
                 
                 <button
                   onClick={() => handleDownload('pdf')}
@@ -160,7 +209,7 @@ export function PaymentSuccessPage() {
                   <svg className="w-5 h-5 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
                   </svg>
-                  Download Ballooned PDF
+                  PDF
                 </button>
 
                 <button
@@ -171,7 +220,7 @@ export function PaymentSuccessPage() {
                   <svg className="w-5 h-5 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                   </svg>
-                  Download Excel Report
+                  Excel
                 </button>
 
                 <button
@@ -182,16 +231,10 @@ export function PaymentSuccessPage() {
                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
                   </svg>
-                  Download Complete Bundle (ZIP)
+                  Bundle (ZIP)
                 </button>
               </div>
-            ) : (
-              <div className="bg-yellow-500/10 border border-yellow-500/20 p-4 rounded-lg">
-                <p className="text-yellow-200 text-sm">
-                  We couldn't auto-recover your file session. Please go to the dashboard to upload and process your file again (it's unlimited now!).
-                </p>
-              </div>
-            )}
+            ) : null}
 
             <button
               onClick={() => navigate('/')}
