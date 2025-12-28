@@ -41,9 +41,27 @@ export function AuthProvider({ children }) {
     localStorage.removeItem(USER_KEY);
   }, []);
 
+  // FIX: Implement real user refresh
   const refreshUser = useCallback(async () => {
+    if (!token) return null;
+    
+    try {
+      const response = await fetch(`${API_BASE_URL}/auth/me`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        const updatedUser = { ...user, ...data };
+        setUser(updatedUser);
+        localStorage.setItem(USER_KEY, JSON.stringify(updatedUser));
+        return updatedUser;
+      }
+    } catch (e) {
+      console.error('Failed to refresh user:', e);
+    }
     return null;
-  }, []);
+  }, [token, user]);
 
   const value = {
     user,
