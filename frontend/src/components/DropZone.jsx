@@ -550,7 +550,8 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
   const [showValueInput, setShowValueInput] = useState(false);
   const [newBalloonRect, setNewBalloonRect] = useState(null);
   const [newBalloonValue, setNewBalloonValue] = useState('');
-  const [isDetectingValue, setIsDetectingValue] = useState(false);
+  const [isDetecting, setIsDetecting] = useState(false);
+  const [detectionError, setDetectionError] = useState(null);
   
   const [showCMMImport, setShowCMMImport] = useState(false);
   const [cmmResults, setCmmResults] = useState({});
@@ -570,6 +571,7 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
           setShowValueInput(false);
           setNewBalloonRect(null);
           setNewBalloonValue('');
+          setDetectionError(null);
         } else if (drawMode) {
           setDrawMode(null);
           setIsDrawing(false);
@@ -627,10 +629,10 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
       setNewBalloonRect({ minX, maxX, minY, maxY });
       setShowValueInput(true);
       setDrawMode(null);
+      setDetectionError(null);
       
-      // TODO: Auto-detect dimension value via OCR
-      // This would crop the image region and send to backend for detection
-      // For now, manual entry with option to detect
+      // Auto-detect dimension value via OCR
+      detectTextInRegion(minX, maxX, minY, maxY);
     } else if (drawMode === 'clearArea') {
       // Delete all balloons inside the rectangle
       setDimensions(prev => prev.filter(d => {
@@ -644,12 +646,86 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
     setDrawEnd(null);
   };
   
+  // ===== OCR Detection for drawn region =====
+  const detectTextInRegion = async (minX, maxX, minY, maxY) => {
+    if (!imageRef.current) return;
+    
+    setIsDetecting(true);
+    setDetectionError(null);
+    
+    try {
+      // Create canvas and crop the region
+      const img = imageRef.current;
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      
+      // Calculate pixel coordinates from percentages
+      const imgWidth = img.naturalWidth;
+      const imgHeight = img.naturalHeight;
+      const cropX = (minX / 100) * imgWidth;
+      const cropY = (minY / 100) * imgHeight;
+      const cropW = ((maxX - minX) / 100) * imgWidth;
+      const cropH = ((maxY - minY) / 100) * imgHeight;
+      
+      // Add some padding around the crop (10%)
+      const padding = Math.max(cropW, cropH) * 0.1;
+      const finalX = Math.max(0, cropX - padding);
+      const finalY = Math.max(0, cropY - padding);
+      const finalW = Math.min(imgWidth - finalX, cropW + padding * 2);
+      const finalH = Math.min(imgHeight - finalY, cropH + padding * 2);
+      
+      canvas.width = finalW;
+      canvas.height = finalH;
+      
+      // Draw the cropped region
+      ctx.drawImage(img, finalX, finalY, finalW, finalH, 0, 0, finalW, finalH);
+      
+      // Convert to base64
+      const croppedBase64 = canvas.toDataURL('image/png').split(',')[1];
+      
+      // Send to backend for OCR
+      const response = await fetch(`${API_BASE_URL}/detect-region`, {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          ...(token && { 'Authorization': `Bearer ${token}` })
+        },
+        body: JSON.stringify({
+          image: croppedBase64,
+          width: finalW,
+          height: finalH
+        })
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        if (data.success && data.detected_text) {
+          setNewBalloonValue(data.detected_text);
+        } else if (data.dimensions && data.dimensions.length > 0) {
+          // If it returns dimensions array, use the first one
+          setNewBalloonValue(data.dimensions[0].value || data.dimensions[0]);
+        } else {
+          setDetectionError('No text detected. Enter value manually.');
+        }
+      } else {
+        // Endpoint might not exist yet, allow manual entry
+        setDetectionError('Auto-detect unavailable. Enter value manually.');
+      }
+    } catch (err) {
+      console.error('Region detection failed:', err);
+      setDetectionError('Detection failed. Enter value manually.');
+    } finally {
+      setIsDetecting(false);
+    }
+  };
+  
   // Add balloon confirmation
   const handleAddBalloonConfirm = () => {
     if (!newBalloonRect || !newBalloonValue.trim()) {
       setShowValueInput(false);
       setNewBalloonRect(null);
       setNewBalloonValue('');
+      setDetectionError(null);
       return;
     }
     
@@ -683,6 +759,7 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
     setShowValueInput(false);
     setNewBalloonRect(null);
     setNewBalloonValue('');
+    setDetectionError(null);
   };
   
   // Download handlers (Glass Wall protected)
@@ -853,27 +930,42 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
     <div className="space-y-6">
       {showCMMImport && <CMMImportModal dimensions={dimensions} onClose={() => setShowCMMImport(false)} onImport={handleCMMImport} />}
       
-      {/* Value Input Popup for Add Balloon */}
+      {/* Value Input Popup with OCR detection status */}
       {showValueInput && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
           <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-6 w-96">
             <h3 className="text-white font-medium mb-2">Add Balloon</h3>
-            <p className="text-gray-400 text-sm mb-4">Enter the dimension value for this area</p>
+            {isDetecting ? (
+              <div className="flex items-center gap-3 mb-4">
+                <div className="w-5 h-5 border-2 border-[#E63946] border-t-transparent rounded-full animate-spin" />
+                <span className="text-gray-400 text-sm">Detecting text in region...</span>
+              </div>
+            ) : (
+              <>
+                {detectionError && (
+                  <p className="text-amber-400 text-xs mb-2">{detectionError}</p>
+                )}
+                <p className="text-gray-400 text-sm mb-3">
+                  {newBalloonValue ? 'Detected value (edit if needed):' : 'Enter the dimension value:'}
+                </p>
+              </>
+            )}
             <input
               type="text"
               value={newBalloonValue}
               onChange={(e) => setNewBalloonValue(e.target.value)}
-              placeholder="e.g., 0.710in, Ø5mm, 21 Teeth 0.080in Pitch..."
+              placeholder="e.g., 0.45\", 21 Teeth 0.080in Pitch..."
               className="w-full px-3 py-2 bg-[#0a0a0a] border border-[#2a2a2a] rounded-lg text-white text-sm mb-4"
               autoFocus
+              disabled={isDetecting}
               onKeyDown={(e) => {
-                if (e.key === 'Enter') handleAddBalloonConfirm();
-                if (e.key === 'Escape') { setShowValueInput(false); setNewBalloonRect(null); setNewBalloonValue(''); }
+                if (e.key === 'Enter' && !isDetecting) handleAddBalloonConfirm();
+                if (e.key === 'Escape') { setShowValueInput(false); setNewBalloonRect(null); setNewBalloonValue(''); setDetectionError(null); }
               }}
             />
             <div className="flex justify-end gap-2">
-              <button onClick={() => { setShowValueInput(false); setNewBalloonRect(null); setNewBalloonValue(''); }} className="px-4 py-2 text-gray-400 hover:text-white text-sm">Cancel</button>
-              <button onClick={handleAddBalloonConfirm} disabled={!newBalloonValue.trim()} className="px-4 py-2 bg-[#E63946] hover:bg-[#c62d39] text-white rounded-lg text-sm disabled:opacity-50">Add Balloon</button>
+              <button onClick={() => { setShowValueInput(false); setNewBalloonRect(null); setNewBalloonValue(''); setDetectionError(null); }} className="px-4 py-2 text-gray-400 hover:text-white text-sm">Cancel</button>
+              <button onClick={handleAddBalloonConfirm} disabled={!newBalloonValue.trim() || isDetecting} className="px-4 py-2 bg-[#E63946] hover:bg-[#c62d39] text-white rounded-lg text-sm disabled:opacity-50">Add Balloon</button>
             </div>
           </div>
         </div>
@@ -902,41 +994,43 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
           </span>
           
           {result.grid?.detected && !hasMultiplePages && <><div className="h-6 w-px bg-[#2a2a2a]" /><span className="text-sm"><span className="text-gray-400">Grid: </span><span className="text-white font-medium">{result.grid.columns?.length}x{result.grid.rows?.length}</span></span></>}
-          
-          <div className="h-6 w-px bg-[#2a2a2a]" />
-          
-          {/* ===== UX FIX #2: Add Balloon (Rectangle Draw) ===== */}
+        </div>
+        
+        {/* Right side - ALL action buttons in one row */}
+        <div className="flex items-center gap-2 flex-wrap">
+          {/* Add Balloon */}
           <button
             onClick={() => setDrawMode(drawMode === 'addBalloon' ? null : 'addBalloon')}
-            className={`px-3 py-1.5 rounded-lg transition-colors text-sm flex items-center gap-2 ${drawMode === 'addBalloon' ? 'bg-[#E63946] text-white' : 'bg-[#1a1a1a] hover:bg-[#252525] text-gray-300'}`}
+            className={`px-3 py-2 rounded-lg transition-colors text-sm flex items-center gap-2 ${drawMode === 'addBalloon' ? 'bg-[#E63946] text-white' : 'bg-[#1a1a1a] hover:bg-[#252525] text-gray-300'}`}
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
             {drawMode === 'addBalloon' ? 'Cancel' : 'Add Balloon'}
           </button>
           
-          {/* ===== UX FIX #3: Clear Area (Rectangle Draw) ===== */}
+          {/* Clear Area */}
           <button
             onClick={() => setDrawMode(drawMode === 'clearArea' ? null : 'clearArea')}
-            className={`px-3 py-1.5 rounded-lg transition-colors text-sm flex items-center gap-2 ${drawMode === 'clearArea' ? 'bg-red-600 text-white' : 'bg-[#1a1a1a] hover:bg-[#252525] text-gray-300'}`}
+            className={`px-3 py-2 rounded-lg transition-colors text-sm flex items-center gap-2 ${drawMode === 'clearArea' ? 'bg-red-600 text-white' : 'bg-[#1a1a1a] hover:bg-[#252525] text-gray-300'}`}
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
             {drawMode === 'clearArea' ? 'Cancel' : 'Clear Area'}
           </button>
-        </div>
-        
-        <div className="flex items-center gap-3">
-          <button onClick={() => setShowCMMImport(true)} className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors text-sm flex items-center gap-2">
+          
+          <div className="h-6 w-px bg-[#2a2a2a]" />
+          
+          {/* Import CMM */}
+          <button onClick={() => setShowCMMImport(true)} className="px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm flex items-center gap-2">
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
             Import CMM
           </button>
-          <button onClick={handleDownloadImage} disabled={isDownloading} className="px-4 py-2 bg-[#1a1a1a] hover:bg-[#252525] text-gray-300 rounded-lg transition-colors text-sm disabled:opacity-50 flex items-center gap-2">
+          
+          {/* Save Page */}
+          <button onClick={handleDownloadImage} disabled={isDownloading} className="px-3 py-2 bg-[#1a1a1a] hover:bg-[#252525] text-gray-300 rounded-lg text-sm disabled:opacity-50 flex items-center gap-2">
             {!isPro && <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>}
-            {isDownloading ? 'Saving...' : `Save Page ${currentPage}`}
+            Save Page {currentPage}
           </button>
-          <button onClick={() => handleExport('csv')} disabled={isExporting} className="px-4 py-2 bg-[#1a1a1a] hover:bg-[#252525] text-gray-300 rounded-lg transition-colors text-sm disabled:opacity-50 flex items-center gap-2">
-            {!isPro && <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>}
-            Export CSV
-          </button>
+          
+          {/* Download Menu */}
           <DownloadMenu onDownloadPDF={handleDownloadPDF} onDownloadZIP={handleDownloadZIP} onDownloadExcel={handleDownloadExcel} isDownloading={isDownloading} totalPages={totalPages} totalDimensions={getTotalDimensions()} isPro={isPro} />
         </div>
       </div>
@@ -945,11 +1039,11 @@ function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, curre
       <div className="bg-[#1a1a1a] rounded-lg px-3 py-2 text-sm text-gray-400 flex items-center gap-2">
         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
         {drawMode === 'addBalloon' ? (
-          <span className="text-[#E63946]">Draw a rectangle around the dimension you want to balloon. Press Escape to cancel.</span>
+          <span className="text-[#E63946]">Draw a rectangle around the dimension. Text will be auto-detected. Press Escape to cancel.</span>
         ) : drawMode === 'clearArea' ? (
           <span className="text-red-400">Draw a rectangle over the balloons you want to delete. Press Escape to cancel.</span>
         ) : (
-          <span>Hover over balloons to see details. Drag to reposition. {totalPages > 1 ? 'Use page navigation or ← → keys to switch pages.' : ''}</span>
+          <span>Hover over balloons to see details. Drag to reposition.</span>
         )}
       </div>
 
