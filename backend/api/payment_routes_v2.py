@@ -1,6 +1,6 @@
 """
 Payment Routes - LemonSqueezy Integration for Glass Wall
-Handles checkout creation and webhook processing for 24h Pass, Monthly, and Yearly plans.
+Handles checkout creation, webhook processing, and account activation.
 """
 from fastapi import APIRouter, Request, Header, HTTPException
 from pydantic import BaseModel, EmailStr
@@ -13,7 +13,8 @@ from datetime import datetime, timedelta
 
 # Import Supabase client
 from supabase import create_client, Client
-from services.auth_service import AuthService  # FIX: Import AuthService to send emails
+# FIX: Import the auth_service instance to send magic links
+from services.auth_service import auth_service
 
 router = APIRouter(prefix="/payments", tags=["Payments"])
 
@@ -49,7 +50,7 @@ def get_supabase() -> Optional[Client]:
 class PricingResponse(BaseModel):
     pass_price: int = 49
     pro_price: int = 99
-    yearly_price: int = 990  # Example: 10 months price for 12 months
+    yearly_price: int = 990
     currency: str = "USD"
     pass_features: list[str]
     pro_features: list[str]
@@ -304,8 +305,11 @@ async def handle_order_created(payload: dict, supabase):
         print(f"24-hour pass activated for {email}")
         
         # FIX: Send Magic Link so they can log in!
-        await AuthService.send_magic_link(email)
-        print(f"Magic link sent to {email}")
+        try:
+            auth_service.create_magic_link(email)
+            print(f"Magic link sent to {email}")
+        except Exception as e:
+            print(f"Failed to send magic link: {e}")
         
     except Exception as e:
         print(f"Error handling order: {e}")
@@ -366,8 +370,11 @@ async def handle_subscription_created(payload: dict, supabase):
         print(f"Pro subscription ({plan_type}) activated for {email}")
 
         # FIX: Send Magic Link so they can log in!
-        await AuthService.send_magic_link(email)
-        print(f"Magic link sent to {email}")
+        try:
+            auth_service.create_magic_link(email)
+            print(f"Magic link sent to {email}")
+        except Exception as e:
+            print(f"Failed to send magic link: {e}")
         
     except Exception as e:
         print(f"Error handling subscription: {e}")
