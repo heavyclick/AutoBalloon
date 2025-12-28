@@ -1,21 +1,19 @@
 """
-Region Detection Endpoint - Full Pipeline Integration
+Region Detection Endpoint - Smart Center-Weighted Pipeline
 POST /api/detect-region
 
-Uses the SAME detection pipeline as full-page detection:
-1. OCR Service (Google Vision) - get raw text tokens
-2. Intelligent Grouping - combine modifiers, tolerances, compounds
-3. Gemini Vision - semantic understanding of what IS a dimension
-4. Pattern Library - comprehensive validation
-
-This ensures Add Balloon works as reliably as the main detection.
+Features:
+1. Center-Weighted Priority: Focuses on text in the middle of the crop (where user clicked).
+2. Intelligent Grouping: Handles "For", "Teeth", "Pitch" patterns.
+3. Gemini Vision: Semantic understanding with center-focus prompt.
 """
 import base64
 import asyncio
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
+import re
 
-# Import existing services - reuse everything
+# Import existing services
 from services.ocr_service import OCRService, OCRDetection, create_ocr_service
 from services.vision_service import VisionService, create_vision_service
 from services.pattern_library import PATTERNS
@@ -23,95 +21,68 @@ from config import GOOGLE_CLOUD_API_KEY, GEMINI_API_KEY
 
 
 class RegionDetectRequest(BaseModel):
-    """Request body for region detection."""
-    image: str  # Base64 encoded cropped image
+    image: str
     width: int
     height: int
 
 
 class RegionDetectResponse(BaseModel):
-    """Response with detected text."""
     success: bool
     detected_text: Optional[str] = None
     confidence: Optional[float] = None
     dimensions: Optional[List[dict]] = None
     error: Optional[str] = None
-    # Debug info for troubleshooting
     debug: Optional[dict] = None
 
 
 class RegionDetectionService:
-    """
-    Handles dimension detection for cropped regions.
-    Uses the same pipeline as full-page detection for consistency.
-    """
     
-    def __init__(
-        self,
-        ocr_service: Optional[OCRService] = None,
-        vision_service: Optional[VisionService] = None
-    ):
+    def __init__(self, ocr_service: Optional[OCRService] = None, vision_service: Optional[VisionService] = None):
         self.ocr_service = ocr_service
         self.vision_service = vision_service
     
-    async def detect(
-        self,
-        image_bytes: bytes,
-        width: int,
-        height: int,
-        include_debug: bool = False
-    ) -> RegionDetectResponse:
+    async def detect(self, image_bytes: bytes, width: int, height: int, include_debug: bool = False) -> RegionDetectResponse:
         """
-        Detect dimension text in a cropped image region.
-        
-        Pipeline:
-        1. Run OCR to get raw tokens
-        2. Group tokens intelligently (modifiers, tolerances, compounds)
-        3. Run Gemini for semantic understanding
-        4. Validate with pattern library
-        5. Return best result
+        Detect dimension with Center-Weighting strategy.
         """
         debug_info = {
             "ocr_raw": [],
             "ocr_grouped": [],
+            "sorted_candidates": [], # New debug info
             "gemini_result": None,
-            "gemini_error": None,
-            "pattern_valid": False,
             "selection_reason": None
         }
         
         try:
-            # ===== STEP 1: Run OCR =====
+            # 1. Run OCR
             raw_ocr = await self._run_ocr(image_bytes, width, height)
-            debug_info["ocr_raw"] = [d.text for d in raw_ocr]
-            
             if not raw_ocr:
-                return RegionDetectResponse(
-                    success=False,
-                    error="No text detected in region",
-                    debug=debug_info if include_debug else None
-                )
+                return RegionDetectResponse(success=False, error="No text detected", debug=debug_info)
             
-            # ===== STEP 2: Group OCR tokens intelligently =====
+            # 2. Group OCR tokens (includes regex fixes for "For", "Teeth")
             grouped_ocr = self._group_ocr(raw_ocr)
-            debug_info["ocr_grouped"] = [d.text for d in grouped_ocr]
             
-            # ===== STEP 3: Run Gemini for semantic understanding =====
-            gemini_result = await self._run_gemini(image_bytes)
+            # === NEW: Center-Weighting Strategy ===
+            # Sort groups by distance to the center (500, 500)
+            # This ensures we pick the text the user actually clicked on, 
+            # even if padding captured neighbor text.
+            grouped_ocr.sort(key=self._calculate_distance_to_center)
+            
+            debug_info["ocr_grouped"] = [d.text for d in grouped_ocr]
+            debug_info["sorted_candidates"] = [
+                f"{d.text} (dist: {int(self._calculate_distance_to_center(d))})" 
+                for d in grouped_ocr
+            ]
+            
+            # 3. Run Gemini (Background)
+            gemini_task = asyncio.create_task(self._run_gemini(image_bytes))
+            gemini_result = await gemini_task
             debug_info["gemini_result"] = gemini_result
             
-            # ===== STEP 4: Select best result =====
-            result = self._select_best_result(
-                grouped_ocr, 
-                gemini_result, 
-                debug_info
-            )
+            # 4. Select Best Result (Prioritizing Center Candidates)
+            result = self._select_best_result(grouped_ocr, gemini_result, debug_info)
             
             if result:
-                # Validate with pattern library
-                is_valid = PATTERNS.is_dimension_text(result["value"])
-                debug_info["pattern_valid"] = is_valid
-                
                 return RegionDetectResponse(
                     success=True,
                     detected_text=result["value"],
@@ -120,195 +91,110 @@ class RegionDetectionService:
                     debug=debug_info if include_debug else None
                 )
             else:
-                # No good result - return raw OCR as fallback
-                fallback = self._get_fallback(raw_ocr, grouped_ocr)
+                # Fallback: Just take the most central text group if it has digits
+                fallback = self._get_fallback(grouped_ocr)
                 if fallback:
-                    debug_info["selection_reason"] = "fallback_raw_ocr"
                     return RegionDetectResponse(
                         success=True,
                         detected_text=fallback,
                         confidence=0.5,
                         dimensions=[{"value": fallback}],
-                        debug=debug_info if include_debug else None
+                        debug=debug_info
                     )
                 
-                return RegionDetectResponse(
-                    success=False,
-                    error="Could not identify dimension in region",
-                    debug=debug_info if include_debug else None
-                )
+                return RegionDetectResponse(success=False, error="No dimension found", debug=debug_info)
                 
         except Exception as e:
-            debug_info["error"] = str(e)
-            return RegionDetectResponse(
-                success=False,
-                error=f"Detection failed: {str(e)}",
-                debug=debug_info if include_debug else None
-            )
-    
-    async def _run_ocr(
-        self, 
-        image_bytes: bytes, 
-        width: int, 
-        height: int
-    ) -> List[OCRDetection]:
-        """Run OCR on the cropped region."""
-        if not self.ocr_service:
-            return []
-        
-        try:
-            return await self.ocr_service.detect_text(image_bytes, width, height)
-        except Exception as e:
-            print(f"OCR error in region detection: {e}")
-            return []
+            import traceback
+            traceback.print_exc()
+            return RegionDetectResponse(success=False, error=str(e), debug=debug_info)
+
+    def _calculate_distance_to_center(self, detection: OCRDetection) -> float:
+        """Calculate distance from detection center to image center (500, 500)."""
+        box = detection.bounding_box
+        cx = (box["xmin"] + box["xmax"]) / 2
+        cy = (box["ymin"] + box["ymax"]) / 2
+        return ((cx - 500) ** 2 + (cy - 500) ** 2) ** 0.5
+
+    async def _run_ocr(self, image_bytes: bytes, width: int, height: int) -> List[OCRDetection]:
+        if not self.ocr_service: return []
+        try: return await self.ocr_service.detect_text(image_bytes, width, height)
+        except: return []
     
     async def _run_gemini(self, image_bytes: bytes) -> Optional[str]:
-        """
-        Run Gemini to semantically identify the dimension.
-        Uses a simplified prompt optimized for small cropped regions.
-        """
-        if not self.vision_service:
-            return None
-        
-        try:
-            # Use a custom prompt for cropped regions
-            result = await self._call_gemini_for_region(image_bytes)
-            return result
-        except Exception as e:
-            print(f"Gemini error in region detection: {e}")
-            return None
+        if not self.vision_service: return None
+        try: return await self._call_gemini_for_region(image_bytes)
+        except: return None
     
     async def _call_gemini_for_region(self, image_bytes: bytes) -> Optional[str]:
-        """Call Gemini with a region-specific prompt."""
-        import httpx
-        import json
-        
+        import httpx, json
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
         
-        prompt = """You are extracting a dimension from a cropped region of an engineering drawing.
+        # Updated Prompt: explicitly asks to focus on CENTER
+        prompt = """You are analyzing a cropped image from a blueprint.
+        The user clicked on a specific dimension in the CENTER of this image.
+        
+        Task: Extract the dimension located at the CENTER/MIDDLE of the image.
+        Ignore other dimensions that might be visible at the edges.
 
-This small image contains ONE dimension or measurement. Extract it EXACTLY as shown.
+        Rules:
+        1. Output ONE value: "0.250", "4X 0.50", "21 Teeth", "For 1/8" Width"
+        2. Keep modifiers (4X, TYP, For) and units (in, mm, ") attached.
+        3. If multiple numbers exist, pick the one in the visual center.
 
-RULES:
-1. Keep modifiers WITH the dimension: "4X 0.2in" is ONE value, not separate
-2. Keep tolerances WITH the dimension: "0.250 +0.005/-0.002" is ONE value  
-3. Keep compound dimensions together: "0.188" Wd. x 7/8" Lg. Key" is ONE value
-4. Include thread callouts fully: "3/4-16 UNF" or "M8x1.25"
-5. Include units if shown: ", ', in, mm
-
-Return ONLY a JSON object with this format:
-{"dimension": "THE_EXACT_VALUE_HERE", "confidence": 0.9}
-
-If no dimension is visible, return:
-{"dimension": null, "confidence": 0}
-
-Return ONLY the JSON, no other text."""
+        Return JSON: {"dimension": "VALUE", "confidence": 0.9}"""
 
         payload = {
-            "contents": [{
-                "parts": [
-                    {"text": prompt},
-                    {
-                        "inline_data": {
-                            "mime_type": "image/png",
-                            "data": image_b64
-                        }
-                    }
-                ]
-            }],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 256,
-                "responseMimeType": "application/json"
-            }
+            "contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/png", "data": image_b64}}]}],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 256, "responseMimeType": "application/json"}
         }
         
-        api_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-        
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.post(
-                f"{api_url}?key={GEMINI_API_KEY}",
-                json=payload,
-                headers={"Content-Type": "application/json"}
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
+                json=payload
             )
-            response.raise_for_status()
             result = response.json()
-        
-        # Parse response
+            
         try:
-            candidates = result.get("candidates", [])
-            if not candidates:
-                return None
-            
-            text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-            
-            # Handle markdown code blocks
-            if text.startswith("```"):
-                lines = text.split("\n")
-                text = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
-            
-            data = json.loads(text.strip())
-            dimension = data.get("dimension")
-            
-            if dimension and isinstance(dimension, str) and dimension.strip():
-                return dimension.strip()
-            
-            return None
-            
-        except (json.JSONDecodeError, KeyError, IndexError) as e:
-            print(f"Gemini response parse error: {e}")
-            return None
+            text = result["candidates"][0]["content"]["parts"][0]["text"]
+            if "```" in text: text = text.split("```")[1].replace("json", "")
+            data = json.loads(text)
+            return data.get("dimension")
+        except: return None
+
+    # ===== UPDATED GROUPING LOGIC (Ported from Full Page Service) =====
     
     def _group_ocr(self, detections: List[OCRDetection]) -> List[OCRDetection]:
-        """
-        Group OCR tokens intelligently.
-        This is adapted from DetectionService._group_ocr() for consistency.
-        """
-        if not detections:
-            return []
+        if not detections: return []
         
-        # Sort by Y then X (reading order)
-        sorted_dets = sorted(
-            detections,
-            key=lambda d: (d.bounding_box["ymin"], d.bounding_box["xmin"])
-        )
+        # Sort by Y then X
+        sorted_dets = sorted(detections, key=lambda d: (d.bounding_box["ymin"], d.bounding_box["xmin"]))
         
         groups = []
         used = set()
         
         for i, det in enumerate(sorted_dets):
-            if i in used:
-                continue
+            if i in used: continue
             
             group = [det]
             used.add(i)
-            
-            # Expand group with related tokens
-            self._expand_group(group, sorted_dets, used, i)
+            self._expand_group(group, sorted_dets, used)
             groups.append(group)
         
         return [self._merge_group(g) for g in groups]
     
-    def _expand_group(
-        self,
-        group: List[OCRDetection],
-        all_dets: List[OCRDetection],
-        used: set,
-        start_idx: int
-    ):
-        """Expand group by finding related tokens."""
-        # Thresholds (in normalized 0-1000 coordinates)
-        H_THRESH = 80   # Horizontal - more lenient for cropped regions
-        V_THRESH = 40   # Vertical (same line)
-        V_STACK = 50    # Vertical stacking
+    def _expand_group(self, group: List[OCRDetection], all_dets: List[OCRDetection], used: set):
+        # More lenient thresholds for cropped regions
+        H_THRESH = 100 
+        V_THRESH = 40
+        V_STACK = 60
         
         changed = True
         while changed:
             changed = False
-            
             for i, det in enumerate(all_dets):
-                if i in used:
-                    continue
+                if i in used: continue
                 
                 for g_det in list(group):
                     if self._should_group(g_det, det, H_THRESH, V_THRESH, V_STACK):
@@ -317,349 +203,167 @@ Return ONLY the JSON, no other text."""
                         changed = True
                         break
     
-    def _should_group(
-        self,
-        det1: OCRDetection,
-        det2: OCRDetection,
-        h_thresh: int,
-        v_thresh: int,
-        v_stack: int
-    ) -> bool:
-        """Determine if two detections should be grouped."""
-        import re
+    def _should_group(self, det1, det2, h_thresh, v_thresh, v_stack) -> bool:
+        b1, b2 = det1.bounding_box, det2.bounding_box
         
-        b1 = det1.bounding_box
-        b2 = det2.bounding_box
-        
-        # Calculate positions
-        c1_x = (b1["xmin"] + b1["xmax"]) / 2
-        c1_y = (b1["ymin"] + b1["ymax"]) / 2
-        c2_x = (b2["xmin"] + b2["xmax"]) / 2
-        c2_y = (b2["ymin"] + b2["ymax"]) / 2
-        
+        # Check proximity
         x_gap = b2["xmin"] - b1["xmax"]
-        y_diff = abs(c2_y - c1_y)
-        x_diff = abs(c2_x - c1_x)
+        y_diff = abs(((b1["ymin"]+b1["ymax"])/2) - ((b2["ymin"]+b2["ymax"])/2))
+        x_overlap = min(b1["xmax"], b2["xmax"]) - max(b1["xmin"], b2["xmin"])
         
-        t1 = det1.text.strip()
-        t2 = det2.text.strip()
+        t1, t2 = det1.text.strip(), det2.text.strip()
         
-        # Case 1: Horizontal adjacency (same line)
+        # Horizontal
         if y_diff <= v_thresh and -10 <= x_gap <= h_thresh:
             return self._should_merge_horizontal(t1, t2, x_gap)
+            
+        # Vertical (Text below)
+        # Ensure decent horizontal alignment (overlap or small x_diff)
+        c1_x = (b1["xmin"] + b1["xmax"]) / 2
+        c2_x = (b2["xmin"] + b2["xmax"]) / 2
         
-        # Case 2: Vertical stacking (text below)
-        if x_diff <= 60 and 0 < (c2_y - c1_y) <= v_stack:
+        if abs(c1_x - c2_x) <= 60 and 0 < (b2["ymin"] - b1["ymax"]) <= v_stack:
             return self._should_merge_vertical(t1, t2)
-        
+            
         return False
-    
+
     def _should_merge_horizontal(self, prev: str, curr: str, gap: float) -> bool:
-        """Should horizontally adjacent tokens merge?"""
-        import re
+        # Modifier patterns (4X, etc)
+        if self._is_modifier(prev) or self._is_modifier(curr): return True
         
-        # Modifier + dimension: "4X" + "0.2in"
-        if self._is_modifier(prev):
-            return True
+        # Fix: "0.160in" + "For"
+        if self._looks_like_dimension(prev) and curr.lower().startswith('for'): return True
         
-        # Dimension + modifier: "0.2in" + "TYP"
-        if self._is_modifier(curr):
-            return True
+        # Fix: "21" + "Teeth"
+        if prev.isdigit() and re.match(r'^(?:Teeth|Tooth|Pitch|Places|Plcs|Holes|Slots)$', curr, re.IGNORECASE): return True
         
-        # Mixed fraction: "3" + "1/4"
-        if prev.isdigit() and re.match(r'^\d+/\d+["\']?$', curr):
-            return True
+        # Fraction parts
+        if prev.isdigit() and re.match(r'^\d+/\d+["\']?$', curr): return True
         
-        # Fraction + unit: "1/4" + '"'
-        if re.match(r'^\d+/\d+$', prev) and curr in ['"', "'", "in", "mm"]:
-            return True
+        # Units
+        if re.match(r'^[\d.]+$', prev) and curr.lower() in ['in', 'mm', '"', "'", "deg"]: return True
         
-        # Tolerance: dimension + "+0.005" or "-0.003"
-        if PATTERNS.is_tolerance(curr):
-            return True
+        # Tolerance
+        if PATTERNS.is_tolerance(curr): return True
         
-        # Compound connectors
-        if re.match(r'^(?:x|X|×|Wd\.?|Lg\.?|Key|OD|ID|Pitch|Teeth)$', curr, re.IGNORECASE):
-            return True
+        # Connectors
+        if re.match(r'^(?:x|X|Wd|Lg|Key|OD|ID)$', curr, re.IGNORECASE): return True
+        if prev.lower() in ['x', 'wd', 'lg']: return True
         
-        # After connector
-        if prev.lower() in ['x', '×', 'wd.', 'wd', 'lg.', 'lg', 'for', 'pitch', 'teeth']:
-            return True
-        
-        # Thread parts
-        if re.match(r'^(?:UN[CF]?|UNF|UNC|NPT|SAE|\(SAE\)|Thread|THD)$', curr, re.IGNORECASE):
-            return True
-        
-        # Continuation chars
-        if curr in ['-', '/', '(', ')', ':', '"', "'"]:
-            return True
-        if prev in ['-', '/', ':', 'For', 'for', '#']:
-            return True
-        
-        # Unit after number
-        if re.match(r'^[\d.]+$', prev) and curr.lower() in ['in', 'mm', 'cm', '"', "'", 'deg']:
-            return True
-        
-        # Number after number with small gap (like "0.080" + "in")
-        if gap <= 30:
-            return True
-        
-        return gap <= 40
-    
-    def _should_merge_vertical(self, upper: str, lower: str) -> bool:
-        """Should vertically stacked tokens merge?"""
-        import re
-        
-        # Tolerance below dimension
-        if PATTERNS.is_tolerance(lower):
-            return True
-        
-        # Descriptive labels
-        if re.match(r'^(?:Flange|Tube|OD|ID|Pipe|Thread|Pitch|Teeth|Key|Lg|Wd)\.?$', lower, re.IGNORECASE):
-            return True
+        # Small gap simple merge
+        if gap <= 25: return True
         
         return False
-    
-    def _is_modifier(self, text: str) -> bool:
-        """Is this a quantity/type modifier?"""
-        import re
-        text = text.strip()
-        patterns = [
-            r'^\d+[xX]$',           # 4X, 2X
-            r'^[xX]\d+$',           # x4, x2
-            r'^\(\d+[xX]\)$',       # (4X)
-            r'^TYP\.?$',            # TYP
-            r'^REF\.?$',            # REF
-            r'^For$',               # For
-        ]
-        return any(re.match(p, text, re.IGNORECASE) for p in patterns)
-    
-    def _merge_group(self, group: List[OCRDetection]) -> OCRDetection:
-        """Merge a group of detections into one."""
-        if len(group) == 1:
-            return group[0]
+
+    def _should_merge_vertical(self, upper: str, lower: str) -> bool:
+        # Tolerance below
+        if PATTERNS.is_tolerance(lower): return True
         
-        # Sort by position
+        # Fix: Descriptive labels below
+        if re.match(r'^(?:Flange|Tube|OD|ID|Pipe|Thread|Pitch|Teeth|For|Max|Min|Typ)$', lower, re.IGNORECASE): return True
+        
+        return False
+
+    def _is_modifier(self, text: str) -> bool:
+        return bool(re.match(r'^(?:\d+[xX]|[xX]\d+|\(\d+[xX]\)|TYP\.?|REF\.?|For)$', text.strip(), re.IGNORECASE))
+
+    def _looks_like_dimension(self, text: str) -> bool:
+        return bool(re.match(r'^\d+\.?\d*["\']?$', text.strip()))
+
+    def _merge_group(self, group: List[OCRDetection]) -> OCRDetection:
+        # Sort by reading order
         group.sort(key=lambda d: (d.bounding_box["ymin"], d.bounding_box["xmin"]))
         
-        # Build text with appropriate spacing
-        parts = []
+        text_parts = []
         for i, det in enumerate(group):
-            text = det.text.strip()
-            
+            t = det.text.strip()
             if i > 0:
-                prev = group[i-1]
-                y_gap = det.bounding_box["ymin"] - prev.bounding_box["ymax"]
-                x_gap = det.bounding_box["xmin"] - prev.bounding_box["xmax"]
-                prev_text = prev.text.strip()
-                
-                # Determine if we need a space
-                need_space = False
-                
-                if y_gap > 15:
-                    # Vertical gap - add space
-                    need_space = True
-                elif x_gap > 20:
-                    # Horizontal gap - add space
-                    need_space = True
-                elif prev_text and prev_text[-1] not in '/-(':
-                    # No space after certain chars
-                    if text and text[0] not in '/"\'-)':
-                        need_space = True
-                
-                if need_space:
-                    parts.append(" ")
+                # Add space logic
+                text_parts.append(" ")
+            text_parts.append(t)
             
-            parts.append(text)
+        merged_text = "".join(text_parts).replace("  ", " ")
         
-        merged_text = "".join(parts)
-        
-        # Clean up common issues
-        merged_text = merged_text.replace("  ", " ").strip()
-        
-        merged_box = {
-            "xmin": min(d.bounding_box["xmin"] for d in group),
-            "xmax": max(d.bounding_box["xmax"] for d in group),
-            "ymin": min(d.bounding_box["ymin"] for d in group),
-            "ymax": max(d.bounding_box["ymax"] for d in group),
-        }
+        # Create merged bbox (min x, max x, etc)
+        x_min = min(d.bounding_box["xmin"] for d in group)
+        x_max = max(d.bounding_box["xmax"] for d in group)
+        y_min = min(d.bounding_box["ymin"] for d in group)
+        y_max = max(d.bounding_box["ymax"] for d in group)
         
         return OCRDetection(
             text=merged_text,
-            bounding_box=merged_box,
-            confidence=sum(d.confidence for d in group) / len(group)
+            bounding_box={"xmin": x_min, "xmax": x_max, "ymin": y_min, "ymax": y_max},
+            confidence=sum(d.confidence for d in group)/len(group)
         )
-    
-    def _select_best_result(
-        self,
-        grouped_ocr: List[OCRDetection],
-        gemini_result: Optional[str],
-        debug_info: dict
-    ) -> Optional[dict]:
+
+    def _select_best_result(self, grouped_ocr: List[OCRDetection], gemini_result: Optional[str], debug_info: dict) -> Optional[dict]:
         """
-        Select the best result from available candidates.
-        
-        Priority:
-        1. Gemini result (if valid dimension)
-        2. Best grouped OCR (if valid dimension)
-        3. Longest grouped OCR with digits
+        Selection Logic:
+        1. grouped_ocr is ALREADY sorted by distance to center.
+        2. If Gemini returned a value, check if it matches the Top 1 or Top 2 central OCR candidates.
+        3. If Gemini failed, take the Top 1 central OCR candidate (if it looks like a dimension).
         """
         
-        # === Priority 1: Gemini result ===
+        # 1. Clean Gemini result
         if gemini_result:
-            # Validate with pattern library
-            if PATTERNS.is_dimension_text(gemini_result):
-                debug_info["selection_reason"] = "gemini_valid_pattern"
-                return {"value": gemini_result, "confidence": 0.95}
+            gemini_clean = self._normalize(gemini_result)
+            # Try to match Gemini against central OCR groups
+            for i, ocr in enumerate(grouped_ocr[:3]): # Check top 3 central items
+                ocr_clean = self._normalize(ocr.text)
+                if gemini_clean in ocr_clean or ocr_clean in gemini_clean:
+                    debug_info["selection_reason"] = f"gemini_matches_central_ocr_rank_{i}"
+                    return {"value": ocr.text, "confidence": 0.95}
             
-            # Even if pattern doesn't match, if Gemini returned something
-            # and it has digits, trust it (Gemini has semantic understanding)
-            if any(c.isdigit() for c in gemini_result):
-                debug_info["selection_reason"] = "gemini_has_digits"
-                return {"value": gemini_result, "confidence": 0.85}
-        
-        # === Priority 2: Best grouped OCR ===
-        valid_ocr = []
-        for ocr in grouped_ocr:
+            # If Gemini found something valid but it doesn't match OCR perfectly, trust Gemini
+            # (It usually implies OCR missed a character but Vision saw it)
+            if PATTERNS.is_dimension_text(gemini_result):
+                debug_info["selection_reason"] = "gemini_standalone_valid"
+                return {"value": gemini_result, "confidence": 0.9}
+
+        # 2. Fallback to Central OCR
+        # We prefer the one closest to center (index 0) that has digits
+        for i, ocr in enumerate(grouped_ocr):
             text = ocr.text.strip()
-            if PATTERNS.is_dimension_text(text):
-                valid_ocr.append({
-                    "value": text,
-                    "confidence": ocr.confidence,
-                    "length": len(text)
-                })
-        
-        if valid_ocr:
-            # Sort by confidence, then by length (prefer longer/more complete)
-            valid_ocr.sort(key=lambda x: (-x["confidence"], -x["length"]))
-            debug_info["selection_reason"] = "ocr_valid_pattern"
-            return valid_ocr[0]
-        
-        # === Priority 3: Any OCR with digits ===
-        for ocr in grouped_ocr:
-            text = ocr.text.strip()
-            if any(c.isdigit() for c in text) and len(text) >= 2:
-                debug_info["selection_reason"] = "ocr_has_digits"
-                return {"value": text, "confidence": 0.6}
-        
-        return None
-    
-    def _get_fallback(
-        self,
-        raw_ocr: List[OCRDetection],
-        grouped_ocr: List[OCRDetection]
-    ) -> Optional[str]:
-        """Get a fallback value if all else fails."""
-        
-        # Try grouped first
-        for ocr in grouped_ocr:
-            text = ocr.text.strip()
+            # If it's very close to center (dist < 150) and has digits, take it
+            dist = self._calculate_distance_to_center(ocr)
+            
             if any(c.isdigit() for c in text):
-                return text
-        
-        # Try raw concatenation
-        all_text = " ".join(d.text.strip() for d in raw_ocr if d.text.strip())
-        if any(c.isdigit() for c in all_text):
-            return all_text
+                if dist < 250: # Must be reasonably central
+                    debug_info["selection_reason"] = f"central_ocr_rank_{i}"
+                    return {"value": text, "confidence": 0.8}
         
         return None
 
+    def _get_fallback(self, grouped_ocr: List[OCRDetection]) -> Optional[str]:
+        # Return the absolute closest text to center that has a number
+        for ocr in grouped_ocr:
+            if any(c.isdigit() for c in ocr.text):
+                return ocr.text
+        return None
 
-# ===== Singleton instance for reuse =====
+    def _normalize(self, text: str) -> str:
+        return re.sub(r'[^\w]', '', text.lower())
+
+
+# Singleton and Router
 _region_service: Optional[RegionDetectionService] = None
 
-
 def get_region_detection_service() -> RegionDetectionService:
-    """Get or create the region detection service."""
     global _region_service
-    
     if _region_service is None:
-        ocr_service = None
-        vision_service = None
-        
-        if GOOGLE_CLOUD_API_KEY:
-            try:
-                ocr_service = create_ocr_service(GOOGLE_CLOUD_API_KEY)
-            except Exception as e:
-                print(f"Failed to create OCR service: {e}")
-        
-        if GEMINI_API_KEY:
-            try:
-                vision_service = create_vision_service(GEMINI_API_KEY)
-            except Exception as e:
-                print(f"Failed to create Vision service: {e}")
-        
-        _region_service = RegionDetectionService(
-            ocr_service=ocr_service,
-            vision_service=vision_service
-        )
-    
+        ocr = None
+        vision = None
+        try: ocr = create_ocr_service(GOOGLE_CLOUD_API_KEY)
+        except: pass
+        try: vision = create_vision_service(GEMINI_API_KEY)
+        except: pass
+        _region_service = RegionDetectionService(ocr, vision)
     return _region_service
 
-
-# ===== Main endpoint function =====
 async def detect_region(request: RegionDetectRequest) -> RegionDetectResponse:
-    """
-    Detect dimension text in a cropped image region.
-    
-    This endpoint is called when a user draws a rectangle in Add Balloon mode.
-    It uses the full detection pipeline (OCR + Gemini + Patterns) for accuracy.
-    """
     try:
-        # Decode the image
-        try:
-            image_bytes = base64.b64decode(request.image)
-        except Exception as e:
-            return RegionDetectResponse(
-                success=False,
-                error=f"Invalid image data: {str(e)}"
-            )
-        
-        # Validate image size
-        if len(image_bytes) < 100:
-            return RegionDetectResponse(
-                success=False,
-                error="Image too small - please draw a larger region"
-            )
-        
-        # Get the detection service
+        image_bytes = base64.b64decode(request.image)
         service = get_region_detection_service()
-        
-        # Check if services are available
-        if not service.ocr_service and not service.vision_service:
-            return RegionDetectResponse(
-                success=False,
-                error="Detection services not configured. Check API keys."
-            )
-        
-        # Run detection with debug info for troubleshooting
-        result = await service.detect(
-            image_bytes=image_bytes,
-            width=request.width,
-            height=request.height,
-            include_debug=True  # Always include for now, can disable in production
-        )
-        
-        return result
-        
+        return await service.detect(image_bytes, request.width, request.height, True)
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return RegionDetectResponse(
-            success=False,
-            error=f"Detection error: {str(e)}"
-        )
-
-
-# ===== FastAPI Router (optional - for modular setup) =====
-def create_router():
-    """Create a FastAPI router for this endpoint."""
-    from fastapi import APIRouter
-    
-    router = APIRouter()
-    
-    @router.post("/detect-region", response_model=RegionDetectResponse)
-    async def detect_region_endpoint(request: RegionDetectRequest):
-        return await detect_region(request)
-    
-    return router
+        return RegionDetectResponse(success=False, error=str(e))
