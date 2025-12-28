@@ -138,11 +138,22 @@ async def capture_email(request: CaptureEmailRequest):
         )
     
     try:
-        # Update session with email
-        supabase.table("guest_sessions").update({
-            "email": request.email,
-            "updated_at": datetime.utcnow().isoformat(),
-        }).eq("session_id", request.session_id).execute()
+        # FIX: Check if session exists first to avoid crashing on update of non-existent row
+        existing = supabase.table("guest_sessions").select("id").eq("session_id", request.session_id).execute()
+        
+        if existing.data and len(existing.data) > 0:
+            supabase.table("guest_sessions").update({
+                "email": request.email,
+                "updated_at": datetime.utcnow().isoformat(),
+            }).eq("session_id", request.session_id).execute()
+        else:
+            # Create minimal session if missing
+            supabase.table("guest_sessions").insert({
+                "session_id": request.session_id, 
+                "email": request.email,
+                "created_at": datetime.utcnow().isoformat(), 
+                "expires_at": (datetime.utcnow() + timedelta(hours=24)).isoformat()
+            }).execute()
         
         return SessionResponse(
             success=True,
@@ -173,39 +184,44 @@ async def retrieve_guest_session(session_id: str):
         )
     
     try:
+        # FIX: Use .execute() returning a list, instead of .single() which crashes on empty
         result = supabase.table("guest_sessions").select("*").eq(
             "session_id", session_id
-        ).single().execute()
+        ).execute()
         
-        if not result.data:
+        if not result.data or len(result.data) == 0:
             return SessionResponse(
                 success=False,
                 session_id=session_id,
                 message="Session not found"
             )
         
+        # Get first result safely
+        data = result.data[0]
+        
         # Check if expired
-        expires_at = datetime.fromisoformat(result.data["expires_at"].replace("Z", "+00:00"))
-        if expires_at < datetime.now(expires_at.tzinfo):
-            return SessionResponse(
-                success=False,
-                session_id=session_id,
-                message="Session expired"
-            )
+        if data.get("expires_at"):
+            expires_at = datetime.fromisoformat(data["expires_at"].replace("Z", "+00:00"))
+            if expires_at < datetime.now(expires_at.tzinfo):
+                return SessionResponse(
+                    success=False,
+                    session_id=session_id,
+                    message="Session expired"
+                )
         
         return SessionResponse(
             success=True,
             session_id=session_id,
             data={
-                "filename": result.data.get("filename"),
-                "image": result.data.get("image_data"),
-                "dimensions": result.data.get("dimensions"),
-                "dimensionCount": result.data.get("dimension_count"),
-                "grid": result.data.get("grid_data"),
-                "totalPages": result.data.get("total_pages"),
-                "pages": result.data.get("pages_data"),
-                "processingTimeMs": result.data.get("processing_time_ms"),
-                "estimatedManualHours": result.data.get("estimated_manual_hours"),
+                "filename": data.get("filename"),
+                "image": data.get("image_data"),
+                "dimensions": data.get("dimensions"),
+                "dimensionCount": data.get("dimension_count"),
+                "grid": data.get("grid_data"),
+                "totalPages": data.get("total_pages"),
+                "pages": data.get("pages_data"),
+                "processingTimeMs": data.get("processing_time_ms"),
+                "estimatedManualHours": data.get("estimated_manual_hours"),
             }
         )
         
