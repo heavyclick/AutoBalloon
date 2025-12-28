@@ -40,12 +40,26 @@ from api.auth_routes import router as auth_router
 from api.payment_routes import router as payment_router
 from api.usage_routes import router as usage_router
 from api.download_routes import router as download_router
+from api.detect_region import detect_region, RegionDetectRequest
 
 app.include_router(main_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 app.include_router(payment_router, prefix="/api")
 app.include_router(usage_router, prefix="/api")
 app.include_router(download_router)
+
+
+# =============================================================================
+# DETECT REGION ENDPOINT - For Add Balloon OCR feature
+# =============================================================================
+
+@app.post("/api/detect-region")
+async def detect_region_endpoint(request: RegionDetectRequest):
+    """
+    Detect dimension text in a cropped image region.
+    Called when user draws rectangle in Add Balloon mode.
+    """
+    return await detect_region(request)
 
 
 # =============================================================================
@@ -320,6 +334,7 @@ async def api_root():
             "/api/export",
             "/api/security",
             "/api/debug",
+            "/api/detect-region",
             "/download/pdf",
             "/download/zip", 
             "/download/image",
