@@ -3,7 +3,7 @@
  * Handles post-payment flow:
  * 1. Exchanges session_id for login token (auto-login)
  * 2. Auto-downloads the requested file (ZIP/PDF/Excel)
- * 3. Redirects to dashboard with Pro access
+ * 3. Redirects to dashboard with Pro access WITHOUT clearing the file
  */
 
 import React, { useEffect, useState } from 'react';
@@ -16,13 +16,16 @@ export function PaymentSuccessPage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { login } = useAuth();
-  const { sessionData, clearSession } = useGuestSession();
+  // Note: We access sessionData but intentionally do NOT use clearSession
+  // so the user can land back on their work.
+  const { sessionData } = useGuestSession();
   
-  const [status, setStatus] = useState('verifying'); // 'verifying', 'success', 'downloading', 'error'
+  const [status, setStatus] = useState('verifying'); // 'verifying', 'success', 'error'
   const [restoredData, setRestoredData] = useState(null);
   const [error, setError] = useState(null);
   const [isDownloading, setIsDownloading] = useState(false);
   const [message, setMessage] = useState('Verifying your payment...');
+  const [autoRedirectTimer, setAutoRedirectTimer] = useState(null);
 
   const sessionId = searchParams.get('session_id');
 
@@ -33,6 +36,11 @@ export function PaymentSuccessPage() {
       setError('No session ID found.');
       setStatus('error');
     }
+    
+    // Cleanup timer on unmount
+    return () => {
+      if (autoRedirectTimer) clearTimeout(autoRedirectTimer);
+    };
   }, [sessionId]);
 
   const handlePostPaymentFlow = async () => {
@@ -84,15 +92,22 @@ export function PaymentSuccessPage() {
         setMessage(`Starting ${pref.toUpperCase()} download...`);
         
         // Trigger download automatically
-        await handleDownload(pref, data);
+        const downloadSuccess = await handleDownload(pref, data);
         
-        // Clear guest session
-        clearSession();
-        
-        // 4. Redirect after delay
-        setTimeout(() => {
-          navigate('/');
-        }, 5000);
+        if (downloadSuccess) {
+          // CRITICAL CHANGE: We do NOT clear session here.
+          // We want the data to persist so the user sees it when they land on dashboard.
+          
+          setMessage('Payment successful! Redirecting you back to your drawing...');
+          
+          // Redirect to dashboard after a short delay
+          const timer = setTimeout(() => {
+            navigate('/');
+          }, 3000);
+          setAutoRedirectTimer(timer);
+        } else {
+          setMessage('Auto-download prevented. Click a button below to download.');
+        }
         
       } else {
         // Payment valid, but data gone (rare)
@@ -110,7 +125,7 @@ export function PaymentSuccessPage() {
 
   const handleDownload = async (type, dataOverride = null) => {
     const data = dataOverride || restoredData;
-    if (!data) return;
+    if (!data) return false;
     
     setIsDownloading(true);
 
@@ -118,6 +133,11 @@ export function PaymentSuccessPage() {
       let endpoint = '/export'; // Default
       let payload = {};
       let filename = data.filename || 'inspection';
+
+      // Validate data before sending to prevent crashes
+      if (!data.pages || data.pages.length === 0) {
+        throw new Error("Drawing data is incomplete.");
+      }
 
       if (type === 'pdf') {
         endpoint = '/download/pdf';
@@ -162,11 +182,14 @@ export function PaymentSuccessPage() {
         a.click();
         document.body.removeChild(a);
         window.URL.revokeObjectURL(url);
+        return true;
       } else {
         console.error("Download failed status:", response.status);
+        return false;
       }
     } catch (e) {
       console.error("Download exception:", e);
+      return false;
     } finally {
       setIsDownloading(false);
     }
@@ -194,7 +217,7 @@ export function PaymentSuccessPage() {
             
             <h1 className="text-2xl font-bold text-white mb-2">Payment Successful!</h1>
             <p className="text-gray-400 mb-6">
-              Your account is active. {restoredData ? "Your download should start automatically." : ""}
+              {message}
             </p>
 
             {restoredData ? (
