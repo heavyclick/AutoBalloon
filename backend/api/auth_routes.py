@@ -104,8 +104,20 @@ async def require_pro(user: User = Depends(require_auth)) -> User:
 async def request_magic_link(request: MagicLinkRequest):
     """
     Send a magic login link to the user's email.
-    Creates account if doesn't exist.
+    Checks if user exists and is Pro. If not, raises 402.
     """
+    # 1. Check if user exists and is allowed to login
+    user = auth_service.get_user_by_email(request.email)
+    
+    # If user does not exist OR user exists but is not Pro -> BLOCK
+    # This prevents free users from logging in without paying
+    if not user or not user.is_pro:
+        raise HTTPException(
+            status_code=402,  # Payment Required
+            detail="Active subscription required to login."
+        )
+
+    # 2. Only proceed if authorized
     token = auth_service.create_magic_link(request.email)
     
     if token:
