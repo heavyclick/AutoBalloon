@@ -50,41 +50,75 @@ export function LoginPage() {
     }
   };
 
+  const handleSwitchPlan = async (targetPlan) => {
+    try {
+        const response = await fetch(`${API_BASE_URL}/payments/create-checkout`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                email, 
+                plan_type: targetPlan, 
+                callback_url: `${window.location.origin}/success` 
+            }),
+        });
+        const data = await response.json();
+        if (data.authorization_url) window.location.href = data.authorization_url;
+    } catch (e) {
+        console.error(e);
+    }
+  };
+
   if (sent) {
     return (
       <div className="min-h-screen bg-[#0d0d0d] flex items-center justify-center px-4">
         <div className="max-w-md w-full text-center">
           {/* Success icon */}
-          <div className="w-20 h-20 bg-green-500/20 rounded-full flex items-center justify-center mx-auto mb-6">
-            <svg className="w-10 h-10 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <div className="w-16 h-16 bg-green-500/20 rounded-full flex items-center justify-center mx-auto mb-6">
+            <svg className="w-8 h-8 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
             </svg>
           </div>
 
-          <h1 className="text-2xl font-bold text-white mb-4">
+          <h1 className="text-xl font-bold text-white mb-2">
             Check your email
           </h1>
-          <p className="text-gray-400 mb-8">
+          <p className="text-gray-400 mb-6 text-sm">
             We sent a login link to <span className="text-white font-medium">{email}</span>.
             <br />
             Click the link to sign in. It expires in 15 minutes.
           </p>
 
-          <div className="space-y-4">
-            <button
-              onClick={() => setSent(false)}
-              className="text-gray-400 hover:text-white transition-colors text-sm"
-            >
-              Didn't receive it? Try again
-            </button>
-
-            <Link
-              to="/"
-              className="block text-[#E63946] hover:underline text-sm"
-            >
-              ← Back to home
-            </Link>
+          {/* ACTIVE USER MESSAGING */}
+          <div className="bg-[#161616] border border-[#2a2a2a] rounded-xl p-4 mb-6 text-left">
+            <div className="flex items-center gap-2 mb-2">
+                <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
+                <p className="text-green-400 text-xs font-bold uppercase">Active Subscription</p>
+            </div>
+            <p className="text-gray-300 text-sm mb-4">
+              You already have an active account. Click the link in your email to log in.
+            </p>
+            
+            <div className="pt-4 border-t border-[#2a2a2a]">
+              <p className="text-gray-500 text-xs mb-2">Want to change your plan?</p>
+              <div className="flex flex-col gap-2 text-sm">
+                <button onClick={() => handleSwitchPlan('pro_annual')} className="text-[#E63946] hover:text-white text-left transition-colors flex items-center justify-between group">
+                    <span>Switch to Annual Plan ($792/yr)</span>
+                    <span className="opacity-0 group-hover:opacity-100">→</span>
+                </button>
+                <button onClick={() => handleSwitchPlan('pro_monthly')} className="text-[#E63946] hover:text-white text-left transition-colors flex items-center justify-between group">
+                    <span>Switch to Monthly Plan ($99/mo)</span>
+                    <span className="opacity-0 group-hover:opacity-100">→</span>
+                </button>
+              </div>
+            </div>
           </div>
+
+          <Link
+            to="/"
+            className="text-gray-500 hover:text-white transition-colors text-sm"
+          >
+            ← Back to home
+          </Link>
         </div>
       </div>
     );
@@ -116,7 +150,7 @@ export function LoginPage() {
             Welcome back
           </h1>
           <p className="text-gray-400 text-center mb-8">
-            Enter your email and we'll send you a login link
+            Enter your email to login or subscribe
           </p>
 
           <form onSubmit={handleSubmit} className="space-y-6">
@@ -145,15 +179,15 @@ export function LoginPage() {
               disabled={isLoading}
               className="w-full bg-[#E63946] hover:bg-[#c62d39] text-white font-bold py-3 rounded-lg transition-colors disabled:opacity-50"
             >
-              {isLoading ? 'Sending...' : 'Send login link'}
+              {isLoading ? 'Checking...' : 'Continue'}
             </button>
           </form>
 
           <div className="mt-6 text-center">
             <p className="text-gray-500 text-sm">
-              No account?{' '}
+              New here?{' '}
               <span className="text-gray-400">
-                Just enter your email — we'll create one for you.
+                Just enter your email to get started.
               </span>
             </p>
           </div>
