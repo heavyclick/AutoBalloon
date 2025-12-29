@@ -15,14 +15,10 @@ export function PaywallModal({ isOpen, onLoginClick, initialEmail = '', hideLogi
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
 
-  // Sync state if prop changes
   useEffect(() => {
-    if (initialEmail) {
-      setEmail(initialEmail);
-    }
+    if (initialEmail) setEmail(initialEmail);
   }, [initialEmail]);
 
-  // Don't show if Pro or not open
   if (!isOpen || isPro) return null;
 
   const handleProceedToCheckout = async (plan) => {
@@ -41,17 +37,18 @@ export function PaywallModal({ isOpen, onLoginClick, initialEmail = '', hideLogi
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           email,
-          plan_type: plan, // pass selected plan
+          plan_type: plan,
           callback_url: `${window.location.origin}/success`,
         }),
       });
 
       const data = await response.json();
 
-      if (data.authorization_url) {
-        window.location.href = data.authorization_url;
+      if (data.success && data.checkout_url) {
+        // LemonSqueezy redirect
+        window.location.href = data.checkout_url;
       } else {
-        setError('Failed to initialize payment. Please try again.');
+        setError(data.message || 'Failed to initialize payment. Please try again.');
       }
     } catch (err) {
       setError('Network error. Please check your connection.');
@@ -90,12 +87,12 @@ export function PaywallModal({ isOpen, onLoginClick, initialEmail = '', hideLogi
         ))}
       </ul>
       <button
-        onClick={(e) => { e.stopPropagation(); onSelect(id); }}
+        onClick={(e) => { e.stopPropagation(); handleProceedToCheckout(id); }}
         className={`w-full py-2 rounded-lg text-sm font-bold transition-colors ${
           isSelected ? 'bg-[#E63946] text-white hover:bg-[#d32f3d]' : 'bg-[#2a2a2a] text-gray-300'
         }`}
       >
-        {isLoading && isSelected ? 'Processing...' : 'Subscribe'} 
+        {isLoading && isSelected ? 'Processing...' : (id === 'pass_24h' ? 'Buy Pass' : 'Subscribe')}
       </button>
     </div>
   );
@@ -132,7 +129,7 @@ export function PaywallModal({ isOpen, onLoginClick, initialEmail = '', hideLogi
             period="One-time"
             features={["24 hours access", "Unlimited exports", "No auto-renewal"]}
             isSelected={selectedPlan === 'pass_24h'}
-            onSelect={() => setSelectedPlan('pass_24h')} // Just selects, button triggers checkout
+            onSelect={setSelectedPlan}
           />
           <PlanCard
             id="pro_monthly"
@@ -142,29 +139,18 @@ export function PaywallModal({ isOpen, onLoginClick, initialEmail = '', hideLogi
             features={["Unlimited access", "Priority queue", "Cancel anytime"]}
             badge="POPULAR"
             isSelected={selectedPlan === 'pro_monthly'}
-            onSelect={() => setSelectedPlan('pro_monthly')}
+            onSelect={setSelectedPlan}
           />
           <PlanCard
-            id="pro_annual"
-            title="Pro Annual"
-            price="$792"
+            id="pro_yearly"
+            title="Pro Yearly"
+            price="$990"
             period="per year"
             features={["2 months free", "All Pro features", "Best value"]}
-            badge="SAVE $396"
-            isSelected={selectedPlan === 'pro_annual'}
-            onSelect={() => setSelectedPlan('pro_annual')}
+            badge="SAVE $198"
+            isSelected={selectedPlan === 'pro_yearly'}
+            onSelect={setSelectedPlan}
           />
-        </div>
-
-        {/* Proceed Button for Selected Plan */}
-        <div className="max-w-md mx-auto">
-             <button
-                onClick={() => handleProceedToCheckout(selectedPlan)}
-                disabled={isLoading}
-                className="w-full bg-[#E63946] hover:bg-[#c62d39] text-white font-bold py-3 rounded-lg transition-colors disabled:opacity-50"
-             >
-                {isLoading ? 'Processing...' : `Proceed with ${selectedPlan === 'pass_24h' ? '24h Pass' : selectedPlan === 'pro_annual' ? 'Annual Plan' : 'Monthly Plan'}`}
-             </button>
         </div>
 
         {/* Login Link - Hidden on Login Page */}
@@ -179,7 +165,7 @@ export function PaywallModal({ isOpen, onLoginClick, initialEmail = '', hideLogi
           <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
           </svg>
-          Secured by Paystack • 256-bit encryption
+          Secured by LemonSqueezy • 256-bit encryption
         </p>
       </div>
     </div>
