@@ -4,15 +4,22 @@
  * Cannot be dismissed - must upgrade or login
  */
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { API_BASE_URL, PRICE_MONTHLY, PRICE_FUTURE } from '../constants/config';
 
-export function PaywallModal({ isOpen, onLoginClick }) {
+export function PaywallModal({ isOpen, onLoginClick, initialEmail = '', hideLoginLink = false }) {
   const { isPro } = useAuth();
-  const [email, setEmail] = useState('');
+  const [email, setEmail] = useState(initialEmail);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
+
+  // Sync state if prop changes
+  useEffect(() => {
+    if (initialEmail) {
+      setEmail(initialEmail);
+    }
+  }, [initialEmail]);
 
   // Don't show if Pro or not open
   if (!isOpen || isPro) return null;
@@ -69,10 +76,10 @@ export function PaywallModal({ isOpen, onLoginClick }) {
         {/* Header */}
         <div className="text-center mb-6 pt-4">
           <h2 className="text-2xl font-bold text-white mb-2">
-            You've hit your monthly limit
+            Subscription Required
           </h2>
           <p className="text-gray-400">
-            You saved approximately <span className="text-green-400 font-semibold">1.5 hours</span> of manual work
+            You need an active subscription to log in. Upgrade to Pro to access your account.
           </p>
         </div>
 
@@ -141,16 +148,18 @@ export function PaywallModal({ isOpen, onLoginClick }) {
           </button>
         </form>
 
-        {/* Login link */}
-        <p className="text-center text-gray-500 mt-4 text-sm">
-          Already have an account?{' '}
-          <button
-            onClick={onLoginClick}
-            className="text-[#E63946] hover:underline"
-          >
-            Log in
-          </button>
-        </p>
+        {/* Login link - Hidden on Login Page */}
+        {!hideLoginLink && (
+          <p className="text-center text-gray-500 mt-4 text-sm">
+            Already have an account?{' '}
+            <button
+              onClick={onLoginClick}
+              className="text-[#E63946] hover:underline"
+            >
+              Log in
+            </button>
+          </p>
+        )}
 
         {/* Security note */}
         <p className="text-center text-gray-600 mt-4 text-xs flex items-center justify-center gap-1">
