@@ -60,7 +60,7 @@ class CheckoutRequest(BaseModel):
     plan_type: str  # 'pass_24h', 'pro_monthly', or 'pro_yearly'
     session_id: Optional[str] = None  # Guest session to restore after payment
     promo_code: Optional[str] = None
-    callback_url: Optional[str] = None # Added for compatibility with frontend requests
+    callback_url: Optional[str] = None # Added for compatibility
 
 class CheckoutResponse(BaseModel):
     success: bool
@@ -121,6 +121,15 @@ async def create_checkout(request: CheckoutRequest):
         separator = "&" if "?" in success_url else "?"
         success_url += f"{separator}session_id={request.session_id}"
     
+    # FIX: Construct custom data safely to avoid 422 Errors with empty strings
+    custom_data = {
+        "user_email": str(request.email),
+        "plan_type": str(request.plan_type),
+    }
+    # Only add session_id if it exists and is not empty
+    if request.session_id and request.session_id.strip():
+        custom_data["session_id"] = str(request.session_id)
+
     try:
         async with httpx.AsyncClient() as client:
             checkout_payload = {
@@ -129,11 +138,7 @@ async def create_checkout(request: CheckoutRequest):
                     "attributes": {
                         "checkout_data": {
                             "email": request.email,
-                            "custom": {
-                                "user_email": request.email,
-                                "session_id": request.session_id or "",
-                                "plan_type": request.plan_type,
-                            }
+                            "custom": custom_data, # Use the safe dict here
                         },
                         "checkout_options": {
                             "dark": True,
@@ -184,10 +189,11 @@ async def create_checkout(request: CheckoutRequest):
                     checkout_url=checkout_url
                 )
             else:
+                # Log detailed error for debugging
                 print(f"LemonSqueezy error: {response.status_code} - {response.text}")
                 return CheckoutResponse(
                     success=False,
-                    message="Failed to create checkout. Please try again."
+                    message=f"Payment provider error: {response.status_code}"
                 )
                 
     except Exception as e:
@@ -418,40 +424,3 @@ async def handle_subscription_payment(payload: dict, supabase):
         
     except Exception as e:
         print(f"Error handling payment: {e}")
-
-@router.get("/check-access")
-async def check_access(email: str):
-    """Check if a user has export access (for frontend verification)"""
-    supabase = get_supabase()
-    if not supabase:
-        return {"has_access": False, "reason": "Database not configured"}
-    
-    try:
-        result = supabase.table("users").select(
-            "is_pro, plan_tier, pass_expires_at, subscription_status"
-        ).eq("email", email.lower()).single().execute()
-        
-        if not result.data:
-            return {"has_access": False, "reason": "User not found"}
-        
-        user = result.data
-        
-        # Check Pro status (Active subscription)
-        if user.get("is_pro") and user.get("subscription_status") == "active":
-            return {"has_access": True, "plan": user.get("plan_tier", "pro")}
-        
-        # Check 24-hour pass
-        if user.get("plan_tier") == "pass_24h" and user.get("pass_expires_at"):
-            expires_at = datetime.fromisoformat(user["pass_expires_at"].replace("Z", "+00:00"))
-            if expires_at > datetime.now(expires_at.tzinfo):
-                return {"has_access": True, "plan": "pass_24h", "expires_at": user["pass_expires_at"]}
-        
-        # Check lifetime
-        if user.get("plan_tier") == "pro_lifetime":
-            return {"has_access": True, "plan": "pro_lifetime"}
-        
-        return {"has_access": False, "reason": "No active plan"}
-        
-    except Exception as e:
-        print(f"Error checking access: {e}")
-        return {"has_access": False, "reason": str(e)}
