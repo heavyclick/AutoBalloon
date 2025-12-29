@@ -13,7 +13,6 @@ from datetime import datetime, timedelta
 
 # Import Supabase client
 from supabase import create_client, Client
-# FIX: Import the auth_service instance to send magic links
 from services.auth_service import auth_service
 
 router = APIRouter(prefix="/api/payments", tags=["Payments"])
@@ -60,7 +59,7 @@ class CheckoutRequest(BaseModel):
     plan_type: str  # 'pass_24h', 'pro_monthly', or 'pro_yearly'
     session_id: Optional[str] = None  # Guest session to restore after payment
     promo_code: Optional[str] = None
-    callback_url: Optional[str] = None # Added for compatibility
+    callback_url: Optional[str] = None
 
 class CheckoutResponse(BaseModel):
     success: bool
@@ -117,18 +116,21 @@ async def create_checkout(request: CheckoutRequest):
     # Build success URL with session info
     success_url = request.callback_url if request.callback_url else f"{APP_URL}/payment-success"
     if request.session_id:
-        # Append session_id safely
         separator = "&" if "?" in success_url else "?"
         success_url += f"{separator}session_id={request.session_id}"
     
-    # FIX: Construct custom data safely to avoid 422 Errors with empty strings
+    # ---------------------------------------------------------
+    # FIX: Construct custom data carefully to avoid 422 Errors
+    # LemonSqueezy REJECTS the key if value is empty/null
+    # ---------------------------------------------------------
     custom_data = {
         "user_email": str(request.email),
         "plan_type": str(request.plan_type),
     }
-    # Only add session_id if it exists and is not empty
-    if request.session_id and request.session_id.strip():
-        custom_data["session_id"] = str(request.session_id)
+    
+    # Only insert session_id if it is a non-empty string
+    if request.session_id and isinstance(request.session_id, str) and request.session_id.strip():
+        custom_data["session_id"] = request.session_id.strip()
 
     try:
         async with httpx.AsyncClient() as client:
@@ -138,7 +140,7 @@ async def create_checkout(request: CheckoutRequest):
                     "attributes": {
                         "checkout_data": {
                             "email": request.email,
-                            "custom": custom_data, # Use the safe dict here
+                            "custom": custom_data,  # <--- Using the sanitized dict
                         },
                         "checkout_options": {
                             "dark": True,
@@ -189,11 +191,10 @@ async def create_checkout(request: CheckoutRequest):
                     checkout_url=checkout_url
                 )
             else:
-                # Log detailed error for debugging
                 print(f"LemonSqueezy error: {response.status_code} - {response.text}")
                 return CheckoutResponse(
                     success=False,
-                    message=f"Payment provider error: {response.status_code}"
+                    message="Failed to create checkout. Please try again."
                 )
                 
     except Exception as e:
@@ -273,29 +274,23 @@ async def handle_order_created(payload: dict, supabase):
         return
     
     if plan_type != "pass_24h":
-        return  # Only handle pass purchases here
+        return
     
     if not supabase:
         return
     
     try:
-        # Get or create user
-        user_result = supabase.table("users").select("id").eq(
-            "email", email.lower()
-        ).execute()
-        
+        user_result = supabase.table("users").select("id").eq("email", email.lower()).execute()
         user_id = None
         
         if user_result.data and len(user_result.data) > 0:
             user_id = user_result.data[0]["id"]
-            # Update existing user
             supabase.table("users").update({
                 "plan_tier": "pass_24h",
                 "pass_expires_at": (datetime.utcnow() + timedelta(hours=24)).isoformat(),
-                "is_pro": True,  # Temporary pro access
+                "is_pro": True,
             }).eq("id", user_id).execute()
         else:
-            # Create new user with pass
             result = supabase.table("users").insert({
                 "email": email.lower(),
                 "plan_tier": "pass_24h",
@@ -304,7 +299,6 @@ async def handle_order_created(payload: dict, supabase):
             }).execute()
             user_id = result.data[0]["id"] if result.data else None
         
-        # Claim guest session if provided
         if session_id and user_id:
             supabase.table("guest_sessions").update({
                 "is_claimed": True,
@@ -313,7 +307,6 @@ async def handle_order_created(payload: dict, supabase):
         
         print(f"24-hour pass activated for {email}")
         
-        # Send Magic Link so they can log in
         try:
             auth_service.create_magic_link(email)
             print(f"Magic link sent to {email}")
@@ -324,7 +317,7 @@ async def handle_order_created(payload: dict, supabase):
         print(f"Error handling order: {e}")
 
 async def handle_subscription_created(payload: dict, supabase):
-    """Handle new Pro subscription (Monthly or Yearly)"""
+    """Handle new Pro subscription"""
     custom_data = payload.get("meta", {}).get("custom_data", {})
     data = payload.get("data", {})
     attributes = data.get("attributes", {})
@@ -333,32 +326,26 @@ async def handle_subscription_created(payload: dict, supabase):
     session_id = custom_data.get("session_id")
     subscription_id = str(data.get("id", ""))
     customer_id = str(attributes.get("customer_id", ""))
-    plan_type = custom_data.get("plan_type", "pro_monthly") # Default to monthly if missing
+    plan_type = custom_data.get("plan_type", "pro_monthly")
     
     if not email or not supabase:
         return
     
     try:
-        # Get or create user
-        user_result = supabase.table("users").select("id").eq(
-            "email", email.lower()
-        ).execute()
-        
+        user_result = supabase.table("users").select("id").eq("email", email.lower()).execute()
         user_id = None
         
         if user_result.data and len(user_result.data) > 0:
             user_id = user_result.data[0]["id"]
-            # Update to Pro
             supabase.table("users").update({
-                "plan_tier": plan_type, # 'pro_monthly' or 'pro_yearly'
+                "plan_tier": plan_type,
                 "is_pro": True,
                 "subscription_status": "active",
                 "lemonsqueezy_subscription_id": subscription_id,
                 "lemonsqueezy_customer_id": customer_id,
-                "pass_expires_at": None,  # Clear any pass expiry
+                "pass_expires_at": None,
             }).eq("id", user_id).execute()
         else:
-            # Create new Pro user
             result = supabase.table("users").insert({
                 "email": email.lower(),
                 "plan_tier": plan_type,
@@ -369,7 +356,6 @@ async def handle_subscription_created(payload: dict, supabase):
             }).execute()
             user_id = result.data[0]["id"] if result.data else None
         
-        # Claim guest session
         if session_id and user_id:
             supabase.table("guest_sessions").update({
                 "is_claimed": True,
@@ -378,7 +364,6 @@ async def handle_subscription_created(payload: dict, supabase):
         
         print(f"Pro subscription ({plan_type}) activated for {email}")
 
-        # Send Magic Link so they can log in
         try:
             auth_service.create_magic_link(email)
             print(f"Magic link sent to {email}")
@@ -392,35 +377,37 @@ async def handle_subscription_cancelled(payload: dict, supabase):
     """Handle subscription cancellation"""
     data = payload.get("data", {})
     subscription_id = str(data.get("id", ""))
-    
-    if not supabase:
-        return
-    
+    if not supabase: return
     try:
-        # Find user by subscription ID and downgrade
-        supabase.table("users").update({
-            "subscription_status": "cancelled",
-        }).eq("lemonsqueezy_subscription_id", subscription_id).execute()
-        
+        supabase.table("users").update({"subscription_status": "cancelled"}).eq("lemonsqueezy_subscription_id", subscription_id).execute()
         print(f"Subscription {subscription_id} cancelled")
-        
     except Exception as e:
         print(f"Error handling cancellation: {e}")
 
 async def handle_subscription_payment(payload: dict, supabase):
-    """Handle successful subscription payment (renewal)"""
+    """Handle successful subscription payment"""
     data = payload.get("data", {})
     subscription_id = str(data.get("id", ""))
-    
-    if not supabase:
-        return
-    
+    if not supabase: return
     try:
-        # Ensure user is still active
-        supabase.table("users").update({
-            "subscription_status": "active",
-            "is_pro": True,
-        }).eq("lemonsqueezy_subscription_id", subscription_id).execute()
-        
+        supabase.table("users").update({"subscription_status": "active", "is_pro": True}).eq("lemonsqueezy_subscription_id", subscription_id).execute()
     except Exception as e:
         print(f"Error handling payment: {e}")
+
+@router.get("/check-access")
+async def check_access(email: str):
+    supabase = get_supabase()
+    if not supabase: return {"has_access": False, "reason": "Database not configured"}
+    try:
+        result = supabase.table("users").select("is_pro, plan_tier, pass_expires_at, subscription_status").eq("email", email.lower()).execute()
+        if not result.data: return {"has_access": False, "reason": "User not found"}
+        user = result.data[0]
+        if user.get("is_pro") and user.get("subscription_status") == "active": return {"has_access": True, "plan": user.get("plan_tier", "pro")}
+        if user.get("plan_tier") == "pass_24h" and user.get("pass_expires_at"):
+            expires_at = datetime.fromisoformat(user["pass_expires_at"].replace("Z", "+00:00"))
+            if expires_at > datetime.now(expires_at.tzinfo): return {"has_access": True, "plan": "pass_24h", "expires_at": user["pass_expires_at"]}
+        if user.get("plan_tier") == "pro_lifetime": return {"has_access": True, "plan": "pro_lifetime"}
+        return {"has_access": False, "reason": "No active plan"}
+    except Exception as e:
+        print(f"Error checking access: {e}")
+        return {"has_access": False, "reason": str(e)}
