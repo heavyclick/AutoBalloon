@@ -1,5 +1,5 @@
 """
-Payment Routes - LemonSqueezy Integration for Glass Wall
+Payment Routes - LemonSqueezy Integration
 Handles checkout creation, webhook processing, and account activation.
 """
 from fastapi import APIRouter, Request, Header, HTTPException
@@ -11,7 +11,6 @@ import hashlib
 import os
 from datetime import datetime, timedelta
 
-# Import Supabase client
 from supabase import create_client, Client
 from services.auth_service import auth_service
 
@@ -59,7 +58,7 @@ class CheckoutRequest(BaseModel):
     plan_type: str  # 'pass_24h', 'pro_monthly', or 'pro_yearly'
     session_id: Optional[str] = None  # Guest session to restore after payment
     promo_code: Optional[str] = None
-    callback_url: Optional[str] = None
+    callback_url: Optional[str] = None # Added for compatibility
 
 class CheckoutResponse(BaseModel):
     success: bool
@@ -116,18 +115,30 @@ async def create_checkout(request: CheckoutRequest):
     # Build success URL with session info
     base_success_url = request.callback_url if request.callback_url else f"{APP_URL}/payment-success"
     
-    # Append session_id safely if it exists
+    # Append session_id safely if it exists (for the URL redirect)
     if request.session_id:
         separator = "&" if "?" in base_success_url else "?"
         success_url = f"{base_success_url}{separator}session_id={request.session_id}"
     else:
         success_url = base_success_url
     
-    # FIX: Use empty string instead of "N/A" or None for session_id
+    # -------------------------------------------------------------------------
+    # FIX: STRICT VALIDATION FOR LEMONSQUEEZY
+    # 1. Do NOT convert to string blindly (str(None) -> "None" which fails).
+    # 2. Check if it is actually a string AND not empty.
+    # 3. Default to "" (empty string) if invalid, which LemonSqueezy accepts.
+    # -------------------------------------------------------------------------
+    safe_session_id = ""
+    if request.session_id and isinstance(request.session_id, str) and request.session_id.strip():
+        safe_session_id = request.session_id.strip()
+
+    # Debug print to verify before sending
+    print(f"DEBUG PAYLOAD - Custom Data Session ID: '{safe_session_id}' (Type: {type(safe_session_id)})")
+
     custom_data = {
-        "user_email": request.email,
-        "plan_type": request.plan_type,
-        "session_id": request.session_id or "",  # Empty string if None
+        "user_email": str(request.email),
+        "plan_type": str(request.plan_type),
+        "session_id": safe_session_id 
     }
 
     try:
@@ -138,7 +149,7 @@ async def create_checkout(request: CheckoutRequest):
                     "attributes": {
                         "checkout_data": {
                             "email": request.email,
-                            "custom": custom_data,
+                            "custom": custom_data, # Use the strictly validated dict
                         },
                         "checkout_options": {
                             "dark": True,
@@ -303,8 +314,8 @@ async def handle_order_created(payload: dict, supabase):
             }).execute()
             user_id = result.data[0]["id"] if result.data else None
         
-        # Claim guest session if provided (check for non-empty string)
-        if session_id and user_id:
+        # Claim guest session if provided (and not empty)
+        if session_id and session_id != "" and user_id:
             supabase.table("guest_sessions").update({
                 "is_claimed": True,
                 "claimed_by": user_id,
@@ -368,8 +379,8 @@ async def handle_subscription_created(payload: dict, supabase):
             }).execute()
             user_id = result.data[0]["id"] if result.data else None
         
-        # Claim guest session if provided (check for non-empty string)
-        if session_id and user_id:
+        # Claim guest session
+        if session_id and session_id != "" and user_id:
             supabase.table("guest_sessions").update({
                 "is_claimed": True,
                 "claimed_by": user_id,
