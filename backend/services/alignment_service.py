@@ -32,7 +32,8 @@ class AlignmentService:
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
         
         # Constants
-        self.MIN_MATCH_COUNT = 10
+        # Lowered from 10 to 4 to allow porting/alignment on sparse drawings
+        self.MIN_MATCH_COUNT = 4
         self.RESIZE_WIDTH = 2000  # Standardize analysis width for consistency
 
     def decode_image(self, base64_string: str) -> Optional[np.ndarray]:
