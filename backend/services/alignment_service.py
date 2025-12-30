@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import base64
 import logging
+import hashlib
 from typing import List, Dict, Tuple, Optional
 
 # Configure logging
@@ -98,11 +99,18 @@ class AlignmentService:
     def align_and_compare(self, img_a_b64: str, img_b_b64: str, dims_a: List, dims_b: List) -> Tuple[List, List, Dict]:
         """
         Main Pipeline:
-        1. Decode & Preprocess
-        2. Feature Match & Homography
-        3. Validate Transformation
-        4. Anchor IDs & Compare
+        1. Identical Check (Short-Circuit)
+        2. Decode & Preprocess
+        3. Feature Match & Homography
+        4. Validate Transformation
+        5. Anchor IDs & Compare
         """
+        # --- Step 0: Short-Circuit for Identical Files ---
+        # If the string data is identical, skipping CV saves time and prevents "ghost" drifts
+        if img_a_b64 == img_b_b64:
+             logger.info("Identical base64 strings detected. Using perfect match.")
+             return self._perfect_match(dims_a, dims_b)
+
         stats = {"added": 0, "removed": 0, "modified": 0, "unchanged": 0, "method": "naive"}
         
         # --- Step 1: Image Loading ---
@@ -111,6 +119,14 @@ class AlignmentService:
 
         if img_a_raw is None or img_b_raw is None:
             return self._fallback_compare(dims_a, dims_b, error="Image load failure")
+
+        # --- Step 1.5: Pixel-Perfect Check ---
+        # Sometimes base64 headers differ but images are same. Check pixel hash.
+        if img_a_raw.shape == img_b_raw.shape:
+             diff = cv2.absdiff(img_a_raw, img_b_raw)
+             if not np.any(diff):
+                 logger.info("Identical image pixels detected. Using perfect match.")
+                 return self._perfect_match(dims_a, dims_b)
 
         # --- Step 2: Preprocessing ---
         # We work on scaled/cleaned images for speed and accuracy
@@ -244,6 +260,62 @@ class AlignmentService:
 
         return processed_b, removed_dims, stats
 
+    def _perfect_match(self, dims_a, dims_b):
+        """
+        Handles identical files. Matches dimensions 1:1 based on value and location.
+        Guarantees 0 changes if lists are identical.
+        """
+        stats = {"added": 0, "removed": 0, "modified": 0, "unchanged": 0, "method": "identical_short_circuit"}
+        processed_b = []
+        used_a_ids = set()
+        
+        # In a perfect copy, we assume B is a clone of A.
+        # However, we must match them up logicially in case OCR order jittered slightly.
+        
+        for db in dims_b:
+            best_match = None
+            
+            # Try to find exact match in A (Same ID if preserved, or same Value + Loc)
+            # Since these are new uploads, IDs might reset, so we match by Value + Location
+            
+            box_b = db.bounding_box
+            cx_b = (box_b.xmin + box_b.xmax) / 2
+            cy_b = (box_b.ymin + box_b.ymax) / 2
+            
+            for da in dims_a:
+                if da.id in used_a_ids: continue
+                
+                box_a = da.bounding_box
+                cx_a = (box_a.xmin + box_a.xmax) / 2
+                cy_a = (box_a.ymin + box_a.ymax) / 2
+                
+                # Strict check for "Identical"
+                if abs(cx_a - cx_b) < 5 and abs(cy_a - cy_b) < 5 and str(da.value) == str(db.value):
+                    best_match = da
+                    break
+            
+            if best_match:
+                db.id = best_match.id
+                db.status = "unchanged"
+                used_a_ids.add(best_match.id)
+                stats["unchanged"] += 1
+            else:
+                # This technically shouldn't happen in "Identical" files unless OCR was non-deterministic
+                db.status = "added"
+                stats["added"] += 1
+            
+            processed_b.append(db)
+
+        # Handle removals
+        removed_dims = []
+        for da in dims_a:
+            if da.id not in used_a_ids:
+                da.status = "removed"
+                removed_dims.append(da)
+                stats["removed"] += 1
+                
+        return processed_b, removed_dims, stats
+
     def _fallback_compare(self, dims_a, dims_b, error=""):
         """
         Backup Logic: Geometric Overlap Comparison.
@@ -321,5 +393,5 @@ class AlignmentService:
                 
         return processed_b, removed_dims, stats
 
-# THIS LINE WAS MISSING OR BROKEN IN YOUR UPLOAD:
+# Export singleton
 alignment_service = AlignmentService()
