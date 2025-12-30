@@ -73,7 +73,14 @@ class ParsedValues(BaseModel):
     min_limit: float
     precision: int = 3
     units: str = "in"  # 'in' or 'mm'
-    tolerance_type: str = "bilateral" # 'bilateral', 'limit', 'basic', 'max', 'min'
+    tolerance_type: str = "bilateral" # 'bilateral', 'limit', 'basic', 'max', 'min', 'gdt'
+    
+    # GD&T Specific Fields
+    is_gdt: bool = False
+    gdt_symbol: Optional[str] = None    # e.g., 'Position', 'Perpendicularity'
+    gdt_tolerance: Optional[float] = None
+    gdt_modifiers: Optional[str] = None # e.g., 'MMC', 'LMC'
+    gdt_datums: Optional[str] = None    # e.g., 'A, B, C'
 
 
 class Dimension(BaseModel):
@@ -87,7 +94,7 @@ class Dimension(BaseModel):
     manually_added: bool = False
     manually_moved: bool = False
     
-    # New field for engineering data
+    # Stores the engineering math data
     parsed: Optional[ParsedValues] = None
     
     class Config:
