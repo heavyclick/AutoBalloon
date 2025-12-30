@@ -1,126 +1,141 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { API_BASE_URL } from '../constants/config';
 
 /**
  * PropertiesPanel.jsx
- * Left sidebar for editing detailed properties of the selected dimension.
- * Matches InspectionXpert's "General Settings" / "Characteristic" panel.
- * * Updates:
- * - Added Chart ID, Sheet, View inputs (Dimension Model)
- * - Added Full Specification text area (Parsed Model)
- * - Updated Tolerance UI for Fits (Hole/Shaft) and Bilateral (+/-)
- * - Added Sampling Calculator inputs (ANSI Z1.4)
- * - Expanded Subtypes to include Weld, Surface Finish, GD&T
+ * Side panel for editing dimension attributes, ISO Fits, and Sampling.
+ * FIXED: Data flow now matches the Parent DropZone's state engine.
  */
-export function PropertiesPanel({ selectedDimension, onUpdate }) {
-  if (!selectedDimension) {
+export function PropertiesPanel({ dimension, onUpdate, cmmResult }) {
+  // Local state for Sampling inputs (UI only)
+  const [localSampling, setLocalSampling] = useState({
+    lot_size: 0,
+    aql: 2.5,
+    level: 'II'
+  });
+
+  // Sync local state when dimension changes
+  useEffect(() => {
+    if (dimension?.parsed) {
+        setLocalSampling({
+            lot_size: dimension.parsed.lot_size || 0,
+            aql: dimension.parsed.aql || 2.5,
+            level: dimension.parsed.inspection_level || 'II'
+        });
+    }
+  }, [dimension?.id]);
+
+  if (!dimension) {
     return (
-      <div className="w-64 bg-[#161616] border-r border-[#2a2a2a] p-6 text-center">
-        <div className="text-gray-600 mt-10">
-          <svg className="w-12 h-12 mx-auto mb-4 opacity-20" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.12 2.122" />
-          </svg>
-          <p className="text-sm font-medium">No Selection</p>
-          <p className="text-xs mt-2">Click a balloon to edit properties</p>
-        </div>
+      <div className="h-full flex flex-col items-center justify-center text-gray-500 bg-[#161616]">
+        <svg className="w-12 h-12 mb-4 opacity-20" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.12 2.122" />
+        </svg>
+        <p className="text-sm font-medium">No Selection</p>
+        <p className="text-xs mt-1">Click a balloon to edit</p>
       </div>
     );
   }
 
-  // Helper to safely get nested parsed values
-  const getVal = (field, fallback = '') => {
-    return selectedDimension.parsed?.[field] ?? fallback;
-  };
+  // --- HELPERS ---
+  const getVal = (field, fallback = '') => dimension.parsed?.[field] ?? fallback;
+  const getRoot = (field, fallback = '') => dimension[field] ?? fallback;
 
-  // Helper to safely get root values (fallback to empty string for inputs)
-  const getRoot = (field, fallback = '') => {
-    return selectedDimension[field] ?? fallback;
-  };
-
+  // --- UPDATE HANDLERS ---
+  // Fix: Send the ENTIRE object back to DropZone
   const updateParsed = (field, value) => {
-    onUpdate(selectedDimension.id, {
+    onUpdate({
+      ...dimension,
       parsed: {
-        ...selectedDimension.parsed,
+        ...dimension.parsed,
         [field]: value
       }
     });
   };
 
   const updateRoot = (field, value) => {
-    onUpdate(selectedDimension.id, { [field]: value });
+    onUpdate({
+      ...dimension,
+      [field]: value
+    });
   };
 
-  // Trigger calculation when inputs change
-  React.useEffect(() => {
-    const fetchSampling = async () => {
-        const lotSize = getVal('lot_size');
-        const aql = getVal('aql');
-        const level = getVal('inspection_level');
+  // --- SAMPLING LOGIC ---
+  // Hits the backend when inputs change
+  useEffect(() => {
+    const calculateSampling = async () => {
+        const { lot_size, aql, level } = localSampling;
+        if (lot_size <= 0) return;
 
-        if (lotSize > 0) {
-            try {
-                const res = await fetch(`${API_BASE_URL}/sampling/calculate`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ 
-                        lot_size: Number(lotSize), 
-                        aql: parseFloat(aql), 
-                        level: level 
-                    })
+        try {
+            const res = await fetch(`${API_BASE_URL}/sampling/calculate`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ lot_size, aql, level })
+            });
+            const data = await res.json();
+            
+            // Only update parent if value changed to avoid loops
+            if (data.sample_size !== dimension.parsed?.sample_size) {
+                onUpdate({
+                    ...dimension,
+                    parsed: {
+                        ...dimension.parsed,
+                        lot_size,
+                        aql,
+                        inspection_level: level,
+                        sample_size: data.sample_size
+                    }
                 });
-                const data = await res.json();
-                if (data.sample_size) {
-                    updateParsed('sample_size', data.sample_size);
-                }
-            } catch (e) {
-                console.error("Sampling calc failed", e);
             }
+        } catch (e) {
+            console.error("Sampling calc failed", e);
         }
     };
 
-    // Debounce slightly to avoid too many requests
-    const timer = setTimeout(fetchSampling, 500);
+    const timer = setTimeout(calculateSampling, 600); // Debounce
     return () => clearTimeout(timer);
-  }, [
-    selectedDimension?.parsed?.lot_size, 
-    selectedDimension?.parsed?.aql, 
-    selectedDimension?.parsed?.inspection_level
-  ]);
+  }, [localSampling.lot_size, localSampling.aql, localSampling.level]);
+
 
   return (
-    <div className="w-80 bg-[#161616] border-r border-[#2a2a2a] flex flex-col h-full overflow-y-auto text-gray-300 font-sans">
+    <div className="w-full bg-[#161616] flex flex-col h-full overflow-y-auto text-gray-300 font-sans border-r border-[#2a2a2a]">
+      
       {/* Header */}
       <div className="p-4 border-b border-[#2a2a2a] bg-[#1a1a1a]">
-        <h2 className="text-sm font-bold text-white flex items-center gap-2">
-          <span className="w-6 h-6 rounded-full bg-blue-600 flex items-center justify-center text-xs text-white">
-            {selectedDimension.id}
-          </span>
-          Properties
-        </h2>
+        <div className="flex justify-between items-center">
+            <h2 className="text-sm font-bold text-white flex items-center gap-2">
+                <span className="w-6 h-6 rounded-full bg-[#E63946] flex items-center justify-center text-xs text-white shadow-lg">
+                    {dimension.id}
+                </span>
+                Properties
+            </h2>
+            <span className={`text-[10px] px-2 py-0.5 rounded border ${dimension.confidence > 0.9 ? 'border-green-500/30 text-green-400' : 'border-yellow-500/30 text-yellow-400'}`}>
+                {Math.round((dimension.confidence || 0) * 100)}% Conf.
+            </span>
+        </div>
       </div>
 
       <div className="p-4 space-y-6">
         
-        {/* Section: Identification */}
+        {/* 1. Identification (Schema Requirement #5) */}
         <div className="space-y-3">
-          <h3 className="text-xs font-bold text-gray-500 uppercase tracking-wider">Identification</h3>
+          <h3 className="text-[10px] font-bold text-gray-500 uppercase tracking-wider">Identification</h3>
           
           <div className="grid grid-cols-2 gap-2">
             <div className="space-y-1">
-              <label className="text-xs text-gray-400">Chart ID</label>
+              <label className="text-[10px] text-gray-400">Chart ID</label>
               <input 
-                type="text" 
-                className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-xs text-white outline-none focus:border-blue-500 transition-colors"
-                value={getRoot('chart_char_id')}
-                onChange={(e) => updateRoot('chart_char_id', e.target.value)}
-                placeholder="e.g. 1.1"
+                className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-xs text-white focus:border-[#E63946] outline-none transition-colors"
+                value={getVal('chart_char_id')}
+                onChange={(e) => updateParsed('chart_char_id', e.target.value)}
+                placeholder="1.1"
               />
             </div>
             <div className="space-y-1">
-              <label className="text-xs text-gray-400">Operation</label>
+              <label className="text-[10px] text-gray-400">Operation</label>
               <input 
-                type="text" 
-                className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-xs text-white outline-none focus:border-blue-500 transition-colors"
+                className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-xs text-white focus:border-[#E63946] outline-none"
                 value={getVal('operation')}
                 onChange={(e) => updateParsed('operation', e.target.value)}
                 placeholder="Op 10"
@@ -130,53 +145,48 @@ export function PropertiesPanel({ selectedDimension, onUpdate }) {
 
           <div className="grid grid-cols-2 gap-2">
             <div className="space-y-1">
-              <label className="text-xs text-gray-400">Sheet</label>
+              <label className="text-[10px] text-gray-400">Sheet</label>
               <input 
-                type="text" 
-                className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-xs text-white outline-none focus:border-blue-500 transition-colors"
-                value={getRoot('sheet')}
-                onChange={(e) => updateRoot('sheet', e.target.value)}
-                placeholder="1"
+                className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-xs text-white focus:border-[#E63946] outline-none"
+                value={dimension.page || getVal('sheet')}
+                onChange={(e) => updateRoot('page', parseInt(e.target.value) || 1)}
               />
             </div>
             <div className="space-y-1">
-              <label className="text-xs text-gray-400">View</label>
+              <label className="text-[10px] text-gray-400">View</label>
               <input 
-                type="text" 
-                className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-xs text-white outline-none focus:border-blue-500 transition-colors"
-                value={getRoot('view_name')}
-                onChange={(e) => updateRoot('view_name', e.target.value)}
-                placeholder="Front"
+                className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-xs text-white focus:border-[#E63946] outline-none"
+                value={getVal('view_name')}
+                onChange={(e) => updateParsed('view_name', e.target.value)}
               />
             </div>
           </div>
         </div>
 
-        {/* Section: Definition */}
+        {/* 2. Definition */}
         <div className="space-y-3 pt-4 border-t border-[#2a2a2a]">
-          <h3 className="text-xs font-bold text-gray-500 uppercase tracking-wider">Definition</h3>
+          <h3 className="text-[10px] font-bold text-gray-500 uppercase tracking-wider">Definition</h3>
           
           <div className="space-y-1">
-            <label className="text-xs text-gray-400">Full Specification</label>
+            <label className="text-[10px] text-gray-400">Full Specification</label>
             <textarea 
-              className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-sm text-white focus:border-blue-500 outline-none resize-none h-16 font-mono"
-              value={getVal('full_specification', selectedDimension.value || '')}
+              className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-sm text-white focus:border-[#E63946] outline-none resize-none h-16 font-mono"
+              value={getVal('full_specification', dimension.value)}
               onChange={(e) => updateParsed('full_specification', e.target.value)}
             />
           </div>
 
           <div className="grid grid-cols-2 gap-2">
             <div className="space-y-1">
-              <label className="text-xs text-gray-400">Nominal Value</label>
+              <label className="text-[10px] text-gray-400">Nominal</label>
               <input 
-                type="text" 
-                className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-sm text-white focus:border-blue-500 outline-none"
-                value={getRoot('value')}
+                className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-sm text-white focus:border-[#E63946] outline-none font-mono"
+                value={dimension.value}
                 onChange={(e) => updateRoot('value', e.target.value)}
               />
             </div>
             <div className="space-y-1">
-              <label className="text-xs text-gray-400">Units</label>
+              <label className="text-[10px] text-gray-400">Units</label>
               <select 
                 className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-xs text-gray-300 outline-none"
                 value={getVal('units', 'in')}
@@ -190,63 +200,56 @@ export function PropertiesPanel({ selectedDimension, onUpdate }) {
           </div>
 
           <div className="space-y-1">
-            <label className="text-xs text-gray-400">Feature Type</label>
+            <label className="text-[10px] text-gray-400">Feature Type</label>
             <select 
               className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-xs text-gray-300 outline-none"
               value={getVal('subtype', 'Linear')}
               onChange={(e) => updateParsed('subtype', e.target.value)}
             >
               <option value="Linear">Linear</option>
-              <option value="Diameter">Diameter</option>
-              <option value="Radius">Radius</option>
-              <option value="Angle">Angle</option>
+              <option value="Diameter">Diameter (Ø)</option>
+              <option value="Radius">Radius (R)</option>
               <option value="Chamfer">Chamfer</option>
-              <option value="Note">Note</option>
               <option value="Weld">Weld</option>
-              <option value="Surface Finish">Surface Finish</option>
+              <option value="Note">Note</option>
               <option value="GD&T">GD&T</option>
             </select>
           </div>
         </div>
 
-        {/* Section: Tolerancing */}
+        {/* 3. Tolerancing (Requirement #2) */}
         <div className="space-y-3 pt-4 border-t border-[#2a2a2a]">
-          <h3 className="text-xs font-bold text-gray-500 uppercase tracking-wider">Tolerancing</h3>
+          <h3 className="text-[10px] font-bold text-gray-500 uppercase tracking-wider">Tolerancing</h3>
           
           <div className="space-y-1">
-            <label className="text-xs text-gray-400">Tolerance Type</label>
+            <label className="text-[10px] text-gray-400">Mode</label>
             <select 
-              className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-xs text-gray-300 outline-none"
+              className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-xs text-blue-400 outline-none font-medium"
               value={getVal('tolerance_type', 'bilateral')}
               onChange={(e) => updateParsed('tolerance_type', e.target.value)}
             >
               <option value="bilateral">Bilateral (±)</option>
               <option value="limit">Limit (High/Low)</option>
               <option value="fit">ISO 286 Fit</option>
-              <option value="max">Max</option>
-              <option value="min">Min</option>
-              <option value="basic">Basic</option>
+              <option value="basic">Basic (Boxed)</option>
             </select>
           </div>
 
-          {/* Conditional Inputs based on Tolerance Type */}
           {getVal('tolerance_type') === 'fit' ? (
-            <div className="grid grid-cols-2 gap-2">
+            <div className="grid grid-cols-2 gap-2 animate-fadeIn">
               <div className="space-y-1">
-                <label className="text-xs text-purple-400 font-bold">Hole Fit</label>
+                <label className="text-[10px] text-purple-400 font-bold">Hole Fit</label>
                 <input 
-                  type="text" 
-                  className="w-full bg-[#0a0a0a] border border-purple-900/50 rounded px-2 py-1.5 text-sm text-purple-400 focus:border-purple-500 outline-none font-mono uppercase"
+                  className="w-full bg-[#0a0a0a] border border-purple-900/50 rounded px-2 py-1.5 text-sm text-purple-400 focus:border-purple-500 outline-none font-mono uppercase placeholder-purple-900/50"
                   value={getVal('hole_fit_class')}
                   placeholder="H7"
                   onChange={(e) => updateParsed('hole_fit_class', e.target.value)}
                 />
               </div>
               <div className="space-y-1">
-                <label className="text-xs text-purple-400 font-bold">Shaft Fit</label>
+                <label className="text-[10px] text-purple-400 font-bold">Shaft Fit</label>
                 <input 
-                  type="text" 
-                  className="w-full bg-[#0a0a0a] border border-purple-900/50 rounded px-2 py-1.5 text-sm text-purple-400 focus:border-purple-500 outline-none font-mono uppercase"
+                  className="w-full bg-[#0a0a0a] border border-purple-900/50 rounded px-2 py-1.5 text-sm text-purple-400 focus:border-purple-500 outline-none font-mono uppercase placeholder-purple-900/50"
                   value={getVal('shaft_fit_class')}
                   placeholder="g6"
                   onChange={(e) => updateParsed('shaft_fit_class', e.target.value)}
@@ -256,21 +259,21 @@ export function PropertiesPanel({ selectedDimension, onUpdate }) {
           ) : (
             <div className="grid grid-cols-2 gap-2">
               <div className="space-y-1">
-                <label className="text-xs text-gray-400">Plus (+)</label>
+                <label className="text-[10px] text-gray-400">Plus (+)</label>
                 <input 
                   type="number" step="0.001"
-                  className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-sm text-white outline-none font-mono"
-                  value={getVal('plus_tolerance')}
-                  onChange={(e) => updateParsed('plus_tolerance', e.target.value === '' ? '' : parseFloat(e.target.value))}
+                  className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-sm text-white focus:border-[#E63946] outline-none font-mono"
+                  value={getVal('upper_tol')}
+                  onChange={(e) => updateParsed('upper_tol', parseFloat(e.target.value))}
                 />
               </div>
               <div className="space-y-1">
-                <label className="text-xs text-gray-400">Minus (-)</label>
+                <label className="text-[10px] text-gray-400">Minus (-)</label>
                 <input 
                   type="number" step="0.001"
-                  className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-sm text-white outline-none font-mono"
-                  value={getVal('minus_tolerance')}
-                  onChange={(e) => updateParsed('minus_tolerance', e.target.value === '' ? '' : parseFloat(e.target.value))}
+                  className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-sm text-white focus:border-[#E63946] outline-none font-mono"
+                  value={getVal('lower_tol')}
+                  onChange={(e) => updateParsed('lower_tol', parseFloat(e.target.value))}
                 />
               </div>
             </div>
@@ -288,80 +291,54 @@ export function PropertiesPanel({ selectedDimension, onUpdate }) {
           </div>
         </div>
 
-        {/* Section: Inspection */}
+        {/* 4. Sampling (Requirement #9) */}
         <div className="space-y-3 pt-4 border-t border-[#2a2a2a]">
-          <h3 className="text-xs font-bold text-gray-500 uppercase tracking-wider">Inspection</h3>
+          <h3 className="text-[10px] font-bold text-yellow-600 uppercase tracking-wider">Sampling (ANSI Z1.4)</h3>
           
-          <div className="space-y-1">
-            <label className="text-xs text-gray-400">Method</label>
-            <select 
-              className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-xs text-blue-400 font-medium outline-none"
-              value={getVal('inspection_method', '')}
-              onChange={(e) => updateParsed('inspection_method', e.target.value)}
-            >
-              <option value="">Select Method...</option>
-              <option value="CMM">CMM</option>
-              <option value="Visual">Visual</option>
-              <option value="Caliper">Caliper</option>
-              <option value="Micrometer">Micrometer</option>
-              <option value="Gage Block">Gage Block</option>
-              <option value="Pin Gage">Pin Gage</option>
-              <option value="Height Gage">Height Gage</option>
-            </select>
+          <div className="grid grid-cols-3 gap-2">
+             <div className="space-y-1">
+               <label className="text-[10px] text-gray-400">Lot Size</label>
+               <input 
+                 type="number" 
+                 className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-xs text-white focus:border-yellow-600 outline-none"
+                 value={localSampling.lot_size}
+                 onChange={(e) => setLocalSampling(s => ({...s, lot_size: parseInt(e.target.value) || 0}))}
+               />
+             </div>
+             <div className="space-y-1">
+               <label className="text-[10px] text-gray-400">AQL</label>
+               <select 
+                 className="w-full bg-[#0a0a0a] border border-[#333] rounded px-1 py-1.5 text-xs text-gray-300 outline-none"
+                 value={localSampling.aql}
+                 onChange={(e) => setLocalSampling(s => ({...s, aql: parseFloat(e.target.value)}))}
+               >
+                 <option value="0.65">0.65</option>
+                 <option value="1.0">1.0</option>
+                 <option value="2.5">2.5</option>
+                 <option value="4.0">4.0</option>
+               </select>
+             </div>
+             <div className="space-y-1">
+               <label className="text-[10px] text-yellow-600 font-bold">Inspect</label>
+               <div className="w-full bg-yellow-900/20 border border-yellow-900/50 rounded px-1 py-1.5 text-xs text-yellow-500 font-bold text-center">
+                 {getVal('sample_size', '-')}
+               </div>
+             </div>
           </div>
         </div>
 
-         {/* Section: Sampling (ANSI Z1.4) */}
-         <div className="space-y-3 pt-4 border-t border-[#2a2a2a]">
-          <h3 className="text-xs font-bold text-yellow-600 uppercase tracking-wider">Sampling (ANSI Z1.4)</h3>
-          
-          <div className="space-y-1">
-            <label className="text-xs text-gray-400">Lot Size</label>
-            <input 
-              type="number" 
-              className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-sm text-white outline-none"
-              value={getVal('lot_size', 0)}
-              onChange={(e) => updateParsed('lot_size', parseInt(e.target.value) || 0)}
-              placeholder="Total Lot Qty"
-            />
-          </div>
-
-          <div className="grid grid-cols-2 gap-2">
-              <div className="space-y-1">
-                <label className="text-xs text-gray-400">AQL</label>
-                <select 
-                    className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-xs text-gray-300 outline-none"
-                    value={getVal('aql', '2.5')}
-                    onChange={(e) => updateParsed('aql', e.target.value)}
-                >
-                    <option value="0.65">0.65</option>
-                    <option value="1.0">1.0</option>
-                    <option value="1.5">1.5</option>
-                    <option value="2.5">2.5</option>
-                    <option value="4.0">4.0</option>
-                    <option value="6.5">6.5</option>
-                </select>
-              </div>
-              <div className="space-y-1">
-                <label className="text-xs text-gray-400">Level</label>
-                <select 
-                    className="w-full bg-[#0a0a0a] border border-[#333] rounded px-2 py-1.5 text-xs text-gray-300 outline-none"
-                    value={getVal('inspection_level', 'II')}
-                    onChange={(e) => updateParsed('inspection_level', e.target.value)}
-                >
-                    <option value="I">I (Reduced)</option>
-                    <option value="II">II (Normal)</option>
-                    <option value="III">III (Tight)</option>
-                </select>
-              </div>
-          </div>
-
-          <div className="bg-yellow-900/20 border border-yellow-900/50 rounded p-2 mt-2 flex justify-between items-center">
-             <span className="text-xs text-yellow-500">Required Sample Size:</span>
-             <span className="text-lg font-bold text-white">{getVal('sample_size', 'N/A')}</span>
-          </div>
-
-        </div>
+        {/* 5. CMM Result */}
+        {cmmResult && (
+            <div className="mt-4 p-3 bg-blue-900/10 border border-blue-900/30 rounded-lg">
+                <div className="text-[10px] text-blue-400 uppercase tracking-wide mb-1">CMM Measured</div>
+                <div className="flex justify-between items-end">
+                    <span className="text-xl font-mono text-white">{cmmResult.actual}</span>
+                    <span className={`text-xs px-2 py-0.5 rounded font-bold ${cmmResult.status === 'PASS' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
+                        {cmmResult.status}
+                    </span>
+                </div>
+            </div>
+        )}
 
       </div>
     </div>
