@@ -9,6 +9,7 @@ from services.ocr_service import OCRService, OCRDetection, create_ocr_service
 from services.vision_service import VisionService, create_vision_service
 from services.file_service import FileService, PageImage, FileProcessingResult
 from services.pattern_library import PATTERNS
+from services.fits_service import fits_service
 from models.schemas import Dimension, BoundingBox, ErrorCode, ParsedValues
 
 # Configure logging
@@ -263,14 +264,56 @@ class DetectionService:
             if any(clean_val.startswith(s) for s in gdt_symbols):
                 return self._parse_gdt_frame(clean_val, page_units)
 
+            # === NEW: Detect Quantity (e.g., 4X) ===
+            quantity = 1
+            qty_match = re.search(r'\b(\d+)[xX]\b', clean_val, re.IGNORECASE)
+            if qty_match:
+                quantity = int(qty_match.group(1))
+
+            # === NEW: Detect Subtype (Diameter, Radius, etc) ===
+            subtype = "Linear"
+            upper_val = clean_val.upper()
+            if "R" in upper_val or "RAD" in upper_val:
+                subtype = "Radius"
+            elif "Ø" in upper_val or "DIA" in upper_val:
+                subtype = "Diameter"
+            elif "∠" in upper_val or "DEG" in upper_val:
+                subtype = "Angle"
+            elif "CHAM" in upper_val:
+                subtype = "Chamfer"
+
             # 2. Standard Dimension Parsing
             # Remove modifiers for math check
             clean_val_std = clean_val.upper().replace('Ø', '').replace('R', '')
-            clean_val_std = re.sub(r'\b[2468]X\b', '', clean_val_std)
+            clean_val_std = re.sub(r'\b\d+[xX]\b', '', clean_val_std) # Remove 4X
             clean_val_std = clean_val_std.replace('TYP', '').replace('REF', '')
             clean_val_std = clean_val_std.replace('"', '').replace('IN', '').replace('MM', '')
             clean_val_std = clean_val_std.strip()
+            
+            # === NEW: Check for Hole/Shaft Fits (e.g., "10 H7", "0.500 g6") ===
+            fit_match = re.search(r'([\d.]+)\s*([A-Za-z]{1,2})(\d{1,2})', clean_val_std)
+            if fit_match:
+                nominal = float(fit_match.group(1))
+                fit_class = fit_match.group(2) + fit_match.group(3) # e.g., "H7"
+                
+                # Use Fits Service for lookup
+                upper, lower = fits_service.get_tolerances(fit_class, page_units)
+                
+                return ParsedValues(
+                    nominal=nominal,
+                    upper_tol=upper,
+                    lower_tol=lower,
+                    max_limit=nominal + upper,
+                    min_limit=nominal + lower,
+                    precision=3,
+                    units=page_units,
+                    tolerance_type="fit",
+                    quantity=quantity,
+                    subtype=subtype,
+                    fit_class=fit_class
+                )
 
+            # Continue Standard Parsing
             first_num_match = re.search(r'(\d+\.\d+)', clean_val_std)
             precision = 3
             if first_num_match:
@@ -290,7 +333,9 @@ class DetectionService:
                     min_limit=nominal - tol,
                     precision=precision,
                     units=page_units,
-                    tolerance_type="bilateral"
+                    tolerance_type="bilateral",
+                    quantity=quantity,
+                    subtype=subtype
                 )
 
             # TYPE B: Explicit Upper/Lower (0.250 +0.005 -0.001)
@@ -307,7 +352,9 @@ class DetectionService:
                     min_limit=nominal - lower,
                     precision=precision,
                     units=page_units,
-                    tolerance_type="limit"
+                    tolerance_type="limit",
+                    quantity=quantity,
+                    subtype=subtype
                 )
 
             # TYPE C: Single Limit (MAX/MIN)
@@ -323,7 +370,9 @@ class DetectionService:
                         min_limit=0.0,
                         precision=precision,
                         units=page_units,
-                        tolerance_type="max"
+                        tolerance_type="max",
+                        quantity=quantity,
+                        subtype=subtype
                     )
             
             # TYPE D: Basic / Nominal
@@ -338,7 +387,9 @@ class DetectionService:
                     min_limit=val,
                     precision=precision,
                     units=page_units,
-                    tolerance_type="basic"
+                    tolerance_type="basic",
+                    quantity=quantity,
+                    subtype=subtype
                 )
 
             return None
@@ -386,6 +437,12 @@ class DetectionService:
                 if datum:
                     datums.append(datum)
             
+            # Detect quantity in GD&T strings if present
+            quantity = 1
+            qty_match = re.search(r'\b(\d+)[xX]\b', value_str, re.IGNORECASE)
+            if qty_match:
+                quantity = int(qty_match.group(1))
+            
             return ParsedValues(
                 nominal=0.0,
                 upper_tol=gdt_tolerance,
@@ -396,6 +453,8 @@ class DetectionService:
                 units=page_units,
                 tolerance_type="gdt",
                 is_gdt=True,
+                quantity=quantity,
+                subtype="GD&T",
                 gdt_symbol=gdt_symbol,
                 gdt_tolerance=gdt_tolerance,
                 gdt_modifiers=", ".join(modifiers) if modifiers else None,
