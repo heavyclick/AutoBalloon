@@ -1,6 +1,6 @@
 """
-API Routes - Fixed Version
-Handles file upload, processing, and export generation.
+API Routes - Unified Version
+Handles file upload, processing, export, and smart region detection.
 Compatible with both single-page and multi-page PDFs.
 """
 from typing import Optional, List
@@ -9,6 +9,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import io
 import os
+import json
+from PIL import Image
 
 from models.schemas import (
     ExportFormat, 
@@ -17,20 +19,15 @@ from models.schemas import (
     ExportMetadata,
 )
 
-# FIX: Import the export service (THIS WAS CAUSING THE 500 ERROR)
+# Services
 from services.export_service import export_service
-# FIX: Import the alignment service for robust revision comparison
 from services.alignment_service import alignment_service
-# NEW: Import Region Routes for Smart Ballooning
-from . import region_routes
+from services.detection_service import create_detection_service
 
-router = APIRouter()  # NO PREFIX - endpoints registered at root, main.py handles routing
+# We DO NOT import region_routes here anymore to avoid the ImportError.
+# The logic is now integrated directly below.
 
-# ==================
-# REGISTER SUB-ROUTERS
-# ==================
-router.include_router(region_routes.router, tags=["Region"])
-
+router = APIRouter()
 
 # ==================
 # Helper function to create detection service
@@ -38,7 +35,6 @@ router.include_router(region_routes.router, tags=["Region"])
 
 def get_detection_service():
     """Create detection service with API keys from environment"""
-    from services.detection_service import create_detection_service
     return create_detection_service(
         ocr_api_key=os.getenv("GOOGLE_CLOUD_API_KEY"),
         gemini_api_key=os.getenv("GEMINI_API_KEY")
@@ -174,6 +170,93 @@ async def process_drawing(file: UploadFile = File(...)):
     return response_data
 
 
+# ==================
+# NEW ENDPOINT: Detect Region (Merged from region_routes.py)
+# ==================
+@router.post("/detect-region")
+async def detect_region(
+    file: UploadFile = File(...),
+    xmin: float = Form(...),
+    xmax: float = Form(...),
+    ymin: float = Form(...),
+    ymax: float = Form(...)
+):
+    """
+    Smart Extract: Receives an image and crop coordinates (0-1000 scale).
+    Returns the parsed engineering data (value, tolerance, limits) found in that box.
+    """
+    try:
+        # 1. Read and Load Image
+        image_bytes = await file.read()
+        if not image_bytes:
+            raise HTTPException(status_code=400, detail="Empty file")
+            
+        image = Image.open(io.BytesIO(image_bytes))
+        
+        # 2. Calculate Crop Box
+        # Coordinates come in normalized 0-1000 format from frontend
+        w, h = image.size
+        
+        # Clamp coordinates to ensure valid crop
+        xmin = max(0, min(1000, float(xmin)))
+        xmax = max(0, min(1000, float(xmax)))
+        ymin = max(0, min(1000, float(ymin)))
+        ymax = max(0, min(1000, float(ymax)))
+        
+        # Convert to pixels
+        left = (xmin / 1000) * w
+        top = (ymin / 1000) * h
+        right = (xmax / 1000) * w
+        bottom = (ymax / 1000) * h
+        
+        # Ensure valid box size
+        if (right - left) < 5 or (bottom - top) < 5:
+             raise HTTPException(status_code=400, detail="Selected region is too small")
+
+        # 3. Crop
+        cropped = image.crop((left, top, right, bottom))
+        
+        # Convert crop back to bytes for OCR service
+        crop_byte_arr = io.BytesIO()
+        cropped.save(crop_byte_arr, format='PNG')
+        crop_bytes = crop_byte_arr.getvalue()
+
+        # 4. Run OCR on the crop
+        service = get_detection_service()
+        
+        # Use existing OCR service (pass crop dimensions)
+        detections = await service.ocr_service.detect_text(
+            crop_bytes, 
+            cropped.width, 
+            cropped.height
+        )
+        
+        if not detections:
+            return {
+                "success": False, 
+                "message": "No text found in selected region",
+                "text": ""
+            }
+
+        # 5. Parse Logic
+        # Combine all found words into one string (e.g. "Ø" + "0.250" -> "Ø 0.250")
+        full_text = " ".join([d.text for d in detections])
+        
+        # Run the parsing engine (This uses the updated detection_service with Fits/Tolerances)
+        parsed_data = service._parse_dimension_value(full_text, "in")
+
+        return {
+            "success": True,
+            "text": full_text,
+            "parsed": parsed_data,
+            "confidence": detections[0].confidence if detections else 0.0
+        }
+
+    except Exception as e:
+        print(f"Region detection error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/compare")
 async def compare_revisions(
     file_a: UploadFile = File(...),
@@ -269,8 +352,6 @@ async def export_inspection_data(request: ExportRequest):
     - Excel with AS9102 Form 3 template
     - Multi-page drawings with Sheet column
     """
-    from models.schemas import ExportMetadata
-    
     # Build metadata
     metadata = None
     if request.metadata:
