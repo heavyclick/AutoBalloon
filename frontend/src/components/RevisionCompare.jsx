@@ -13,6 +13,7 @@ export function RevisionCompare({ onCompareComplete, canDownload = false, onShow
   const [revB, setRevB] = useState(null);
   const [isComparing, setIsComparing] = useState(false);
   const [comparisonResult, setComparisonResult] = useState(null);
+  const [includeGhosts, setIncludeGhosts] = useState(true); // Default to true to show what was lost
   const fileInputARef = useRef(null);
   const fileInputBRef = useRef(null);
 
@@ -89,7 +90,7 @@ export function RevisionCompare({ onCompareComplete, canDownload = false, onShow
     }
   };
 
-  const handleUseChanges = () => {
+  const handlePortBalloons = () => {
     // Check if user has access (Pro OR promo)
     if (!canDownload) {
       if (onShowGlassWall) {
@@ -99,12 +100,24 @@ export function RevisionCompare({ onCompareComplete, canDownload = false, onShow
     }
     
     if (comparisonResult && onCompareComplete) {
-      // Return the Revision B dimensions (which now have preserved Anchor IDs)
-      // Filter out 'removed' unless you want to show ghosts in the main editor
-      // Typically we only want active dimensions (Added + Modified + Unchanged)
+      // Prepare the final list of balloons for the new revision
+      let finalDimensions = [...comparisonResult.revB.dimensions];
+
+      // If user wants to see removed items as "Ghosts"
+      if (includeGhosts && comparisonResult.changes.removed) {
+        const ghosts = comparisonResult.changes.removed.map(d => ({
+            ...d,
+            status: 'removed',
+            isGhost: true,
+            // Ensure ghost styling properties are set
+            color: '#ef4444', // Red
+            opacity: 0.5
+        }));
+        finalDimensions = [...finalDimensions, ...ghosts];
+      }
       
       onCompareComplete({
-        dimensions: comparisonResult.revB.dimensions,
+        dimensions: finalDimensions,
         image: comparisonResult.revB.image,
         metadata: comparisonResult.revB.metadata,
         comparison: comparisonResult
@@ -139,7 +152,7 @@ export function RevisionCompare({ onCompareComplete, canDownload = false, onShow
               </span>
               <span className="text-gray-400">- Revision Compare (AI Aligned)</span>
             </h2>
-            <p className="text-gray-400 text-sm">Upload two revisions to find only what changed</p>
+            <p className="text-gray-400 text-sm">Upload two revisions to find changes and port balloons.</p>
           </div>
           <button onClick={() => { setIsOpen(false); setComparisonResult(null); }} className="text-gray-500 hover:text-white">
             <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -367,21 +380,34 @@ export function RevisionCompare({ onCompareComplete, canDownload = false, onShow
               >
                 ← Compare Different Files
               </button>
-              <button
-                onClick={handleUseChanges}
-                className={`px-6 py-2 text-white font-medium rounded-lg flex items-center gap-2 ${
-                  canDownload 
-                    ? 'bg-[#E63946] hover:bg-[#c62d39]' 
-                    : 'bg-[#E63946]/50 cursor-pointer'
-                }`}
-              >
-                {!canDownload && (
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
-                  </svg>
-                )}
-                Import Changes
-              </button>
+              
+              <div className="flex items-center gap-4">
+                 <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                    <input 
+                      type="checkbox" 
+                      checked={includeGhosts} 
+                      onChange={(e) => setIncludeGhosts(e.target.checked)}
+                      className="rounded border-gray-600 bg-transparent text-purple-600 focus:ring-purple-600"
+                    />
+                    Include Removed Items (Ghosts)
+                 </label>
+
+                <button
+                  onClick={handlePortBalloons}
+                  className={`px-6 py-2 text-white font-medium rounded-lg flex items-center gap-2 ${
+                    canDownload 
+                      ? 'bg-gradient-to-r from-[#E63946] to-pink-600 hover:from-[#d62839] hover:to-pink-700 shadow-lg shadow-red-500/20' 
+                      : 'bg-[#E63946]/50 cursor-pointer'
+                  }`}
+                >
+                  {!canDownload && (
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                    </svg>
+                  )}
+                  Port Balloons & Replace Drawing
+                </button>
+              </div>
             </>
           )}
         </div>
