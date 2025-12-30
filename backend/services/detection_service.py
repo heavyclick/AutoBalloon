@@ -40,6 +40,7 @@ class GeminiDimension:
     y_percent: float
     confidence: float
     matched: bool = False  # Track if this dimension has been used
+    type: str = "dimension" # dimension, note, weld, etc.
 
 
 @dataclass
@@ -75,6 +76,8 @@ class DetectionService:
         r'^\(\d+[xX]\)$',       # (4X)
         r'^TYP\.?$',            # TYP
         r'^REF\.?$',            # REF
+        r'^NOTE$',              # NOTE prefix
+        r'^ITEM$',              # ITEM prefix
     ]
     
     def __init__(
@@ -97,6 +100,7 @@ class DetectionService:
         """Detect dimensions from PDF or image."""
         debug_entry = {'filename': filename, 'pages': []}
         
+        # Process file (Extract images AND Vector Text if available)
         file_result = self.file_service.process_file(file_bytes, filename)
         
         if not file_result.success:
@@ -113,10 +117,14 @@ class DetectionService:
         for page_image in file_result.pages:
             page_debug = {'page_number': page_image.page_number}
             
+            # Check for vector text extracted by FileService
+            vector_text = getattr(page_image, 'vector_text', None)
+            
             dimensions, debug_info = await self._detect_on_page(
                 page_image.image_bytes,
                 page_image.width,
-                page_image.height
+                page_image.height,
+                vector_text=vector_text
             )
             
             page_debug.update(debug_info)
@@ -164,13 +172,29 @@ class DetectionService:
         self,
         image_bytes: bytes,
         width: int,
-        height: int
+        height: int,
+        vector_text: Optional[List[Dict[str, Any]]] = None
     ) -> Tuple[List[Dimension], dict]:
-        """Detect dimensions on single page."""
+        """
+        Detect dimensions on single page using Waterfall Strategy.
+        1. Vector Data (if high quality)
+        2. OCR Service (fallback)
+        3. Vision Service (Coordinate Mapping + Verification)
+        """
         debug = {}
         
-        # 1. Get raw OCR
-        raw_ocr = await self._run_ocr(image_bytes, width, height)
+        # 1. Waterfall: Get Text Data
+        if vector_text and len(vector_text) > 0:
+            # STRATEGY A: High-fidelity Vector Data
+            logger.info("Using Vector Text for detection")
+            raw_ocr = self._convert_vector_to_ocr(vector_text)
+            debug['source'] = 'vector'
+        else:
+            # STRATEGY B: Vision API OCR
+            logger.info("Fallback to OCR Service")
+            raw_ocr = await self._run_ocr(image_bytes, width, height)
+            debug['source'] = 'ocr'
+
         debug['raw_ocr_count'] = len(raw_ocr)
         debug['raw_ocr_sample'] = [d.text for d in raw_ocr[:30]]
         
@@ -178,31 +202,46 @@ class DetectionService:
         page_units = self._detect_page_units(raw_ocr)
         debug['detected_units'] = page_units
         
-        # 2. Group OCR intelligently (FIXED: Aggressive Fraction Merging)
+        # 2. Group Text Intelligently
         grouped_ocr = self._group_ocr(raw_ocr)
         debug['grouped_ocr_count'] = len(grouped_ocr)
         debug['grouped_ocr'] = [d.text for d in grouped_ocr]
         
-        # 3. Get Gemini dimensions with locations
+        # 3. Get Gemini dimensions with locations (The "Brain")
         gemini_dims = await self._run_gemini(image_bytes)
         debug['gemini_dimensions'] = [
             {'value': d.value, 'x': d.x_percent, 'y': d.y_percent}
             for d in gemini_dims
         ]
         
-        # 4. Match using LOCATION-FIRST strategy (FIXED: Exclusive Consumption)
+        # 4. Match using LOCATION-FIRST strategy
         matched = self._match_by_location(grouped_ocr, raw_ocr, gemini_dims)
         debug['matched_count'] = len(matched)
         
         # 5. Sort reading order
         sorted_dims = self._sort_reading_order(matched)
         
-        # === NEW: Smart Parse Values (Math + GD&T) ===
+        # === NEW: Smart Parse Values (Math + GD&T + Notes) ===
         for dim in sorted_dims:
             dim.parsed = self._parse_dimension_value(dim.value, page_units)
         
         return sorted_dims, debug
     
+    def _convert_vector_to_ocr(self, vector_text: List[Dict]) -> List[OCRDetection]:
+        """Convert raw vector data dictionaries to OCRDetection objects."""
+        detections = []
+        for item in vector_text:
+            try:
+                # Expecting format: {'text': '...', 'bbox': {'xmin':..., 'ymin':...}}
+                detections.append(OCRDetection(
+                    text=item.get('text', ''),
+                    bounding_box=item.get('bbox', {}),
+                    confidence=1.0  # Vector text is 100% accurate
+                ))
+            except Exception as e:
+                logger.warning(f"Failed to convert vector item: {e}")
+        return detections
+
     async def _run_ocr(self, image_bytes: bytes, w: int, h: int) -> List[OCRDetection]:
         """Run OCR."""
         if not self.ocr_service:
@@ -225,7 +264,8 @@ class DetectionService:
                     x_percent=d.get('x', 50),
                     y_percent=d.get('y', 50),
                     confidence=d.get('confidence', 0.8),
-                    matched=False
+                    matched=False,
+                    type=d.get('type', 'dimension') # Capture type from Vision if available
                 )
                 for d in results
             ]
@@ -251,10 +291,31 @@ class DetectionService:
         return "in" 
 
     def _parse_dimension_value(self, value_str: str, page_units: str) -> Optional[ParsedValues]:
-        """Parses dimensions AND GD&T frames."""
+        """Parses dimensions, GD&T frames, and Non-Dimensional Notes."""
         try:
             clean_val = value_str.strip()
+            upper_val = clean_val.upper()
             
+            # --- 0. Non-Dimensional Check (Notes, Welds) ---
+            
+            # Check for explicitly labeled Notes (e.g., "NOTE 5", "SEE NOTE 2")
+            if "NOTE" in upper_val or "SEE" in upper_val:
+                return ParsedValues(
+                    nominal=0.0, max_limit=0.0, min_limit=0.0,
+                    units=page_units, tolerance_type="basic",
+                    subtype="Note", quantity=1,
+                    precision=0
+                )
+
+            # Check for Weld Symbols (Simple text detection for now, often labeled 'WELD' or specific codes)
+            if "WELD" in upper_val or re.search(r'^[><]\s*\d+', clean_val): # Rudimentary weld symbols
+                return ParsedValues(
+                    nominal=0.0, max_limit=0.0, min_limit=0.0,
+                    units=page_units, tolerance_type="basic",
+                    subtype="Weld", quantity=1,
+                    precision=0
+                )
+
             # 1. GD&T Check (Pipes or Box Start)
             if '|' in clean_val or clean_val.startswith('['):
                 return self._parse_gdt_frame(clean_val, page_units)
@@ -272,7 +333,6 @@ class DetectionService:
 
             # === NEW: Detect Subtype (Diameter, Radius, etc) ===
             subtype = "Linear"
-            upper_val = clean_val.upper()
             if "R" in upper_val or "RAD" in upper_val:
                 subtype = "Radius"
             elif "Ø" in upper_val or "DIA" in upper_val:
@@ -281,6 +341,8 @@ class DetectionService:
                 subtype = "Angle"
             elif "CHAM" in upper_val:
                 subtype = "Chamfer"
+            elif "M" in upper_val and re.match(r'^M\d+', clean_val): # Metric Thread
+                subtype = "Thread"
 
             # 2. Standard Dimension Parsing
             # Remove modifiers for math check
@@ -291,27 +353,32 @@ class DetectionService:
             clean_val_std = clean_val_std.strip()
             
             # === NEW: Check for Hole/Shaft Fits (e.g., "10 H7", "0.500 g6") ===
+            # Regex: Number + Space(opt) + Letter + Number
             fit_match = re.search(r'([\d.]+)\s*([A-Za-z]{1,2})(\d{1,2})', clean_val_std)
-            if fit_match:
-                nominal = float(fit_match.group(1))
-                fit_class = fit_match.group(2) + fit_match.group(3) # e.g., "H7"
-                
-                # Use Fits Service for lookup
-                upper, lower = fits_service.get_tolerances(fit_class, page_units)
-                
-                return ParsedValues(
-                    nominal=nominal,
-                    upper_tol=upper,
-                    lower_tol=lower,
-                    max_limit=nominal + upper,
-                    min_limit=nominal + lower,
-                    precision=3,
-                    units=page_units,
-                    tolerance_type="fit",
-                    quantity=quantity,
-                    subtype=subtype,
-                    fit_class=fit_class
-                )
+            if fit_match and not "X" in clean_val_std: # Avoid confusing 4X10
+                try:
+                    nominal = float(fit_match.group(1))
+                    fit_class = fit_match.group(2) + fit_match.group(3) # e.g., "H7"
+                    
+                    # Use Fits Service for lookup
+                    upper, lower = fits_service.get_tolerances(fit_class, page_units)
+                    
+                    return ParsedValues(
+                        nominal=nominal,
+                        upper_tol=upper,
+                        lower_tol=lower,
+                        max_limit=nominal + upper,
+                        min_limit=nominal + lower,
+                        precision=3,
+                        units=page_units,
+                        tolerance_type="fit",
+                        quantity=quantity,
+                        subtype=subtype,
+                        fit_class=fit_class
+                    )
+                except:
+                    # Fallback if fit look up fails or regex false positive
+                    pass
 
             # Continue Standard Parsing
             first_num_match = re.search(r'(\d+\.\d+)', clean_val_std)
@@ -473,13 +540,6 @@ class DetectionService:
     def recalculate_zones(self, dimensions: List[Dimension], grid_config: Optional[Dict] = None) -> List[Dimension]:
         """
         Recalculates zones for all dimensions based on a custom grid configuration.
-        Used when user calibrates the grid in the UI.
-        
-        grid_config format: {
-            'columns': ['A', 'B', 'C'],
-            'rows': ['1', '2', '3'],
-            'box': {'xmin': 50, 'ymin': 50, 'xmax': 950, 'ymax': 950}  # Optional frame crop
-        }
         """
         cols = grid_config.get('columns') if grid_config else self.STANDARD_GRID_COLUMNS
         rows = grid_config.get('rows') if grid_config else self.STANDARD_GRID_ROWS
@@ -528,7 +588,7 @@ class DetectionService:
         return f"{cols[col_idx]}{rows[row_idx]}"
 
     # ==========================
-    # CORE GROUPING & MATCHING (FIXED)
+    # CORE GROUPING & MATCHING
     # ==========================
 
     def _group_ocr(self, detections: List[OCRDetection]) -> List[OCRDetection]:
@@ -662,11 +722,11 @@ class DetectionService:
         """Should horizontally adjacent tokens merge?"""
         
         # Modifier + dimension: "4X" + "0.2in"
-        if self._is_modifier(prev) and self._looks_like_dimension(curr):
+        if self._is_modifier(prev) and self._looks_like_feature(curr):
             return True
         
         # Dimension + modifier: "0.2in" + "4X"
-        if self._looks_like_dimension(prev) and self._is_modifier(curr):
+        if self._looks_like_feature(prev) and self._is_modifier(curr):
             return True
         
         # Mixed fraction: "3" + "1/4"
@@ -743,9 +803,11 @@ class DetectionService:
                 return True
         return False
     
-    def _looks_like_dimension(self, text: str) -> bool:
-        """Does this look like a dimension value?"""
+    def _looks_like_feature(self, text: str) -> bool:
+        """Does this look like a dimension OR a feature of interest (like a Note)?"""
         text = text.strip()
+        
+        # 1. Standard Dimensions
         patterns = [
             r'^\d+\.?\d*["\']?$',       # 0.2, 0.2", 25
             r'^\d+/\d+["\']?$',         # 1/4"
@@ -753,15 +815,26 @@ class DetectionService:
             r'^\d+\.?\d*(?:in|mm)$',    # 0.2in, 25mm
             r'^[ØøR]\d+',               # Ø5, R2.5
         ]
-        return any(re.match(p, text, re.IGNORECASE) for p in patterns)
+        if any(re.match(p, text, re.IGNORECASE) for p in patterns):
+            return True
+
+        # 2. Notes / Labels
+        if re.match(r'^(?:NOTE|ITEM)\s*\d+', text, re.IGNORECASE):
+            return True
+        
+        # 3. Weld Symbols (simple text check)
+        if "WELD" in text.upper():
+            return True
+
+        return False
     
     def _is_complete_dim(self, text: str) -> bool:
         """Is this a complete standalone dimension?"""
         text = text.strip()
         patterns = [
             r'^\d+\s+\d+/\d+["\']$',    # 3 1/4"
-            r'^\d+/\d+["\']$',            # 1/4"
-            r'^\d+\.?\d*["\']$',          # 0.45"
+            r'^\d+/\d+["\']$',          # 1/4"
+            r'^\d+\.?\d*["\']$',        # 0.45"
             r'^\d+\.\d{2,}(?:in|mm)?$',   # 0.2500in
             r'^[ØøR]\d+\.?\d*["\']?$',    # Ø5
             r'^\d+(?:\.\d+)?\s*mm$',      # 32mm
@@ -880,10 +953,11 @@ class DetectionService:
             for ocr in grouped_ocr:
                 if id(ocr) in used_ocr_ids: continue
                 
-                # GUARD RAIL: Must have SOME text similarity
-                # Prevents "0.188" snapping to "1" just because it's close
+                # GUARD RAIL: Must have SOME text similarity OR be a graphical feature (Note/Weld)
                 text_score = self._text_similarity(gem.value, ocr.text)
-                if text_score < 0.3: continue 
+                is_graphical_feature = gem.type in ['note', 'weld'] # If Vision says it's a note, assume OCR might be messy
+                
+                if text_score < 0.3 and not is_graphical_feature: continue 
                 
                 box = ocr.bounding_box
                 cx = (box["xmin"] + box["xmax"]) / 2
@@ -945,73 +1019,6 @@ class DetectionService:
         n = text.lower()
         # Keep only alphanumeric and dots for comparison
         return re.sub(r'[^\w.]', '', n)
-    
-    def _try_combine_nearby(
-        self,
-        gem: GeminiDimension,
-        raw_ocr: List[OCRDetection],
-        target_x: float,
-        target_y: float,
-        used: set
-    ) -> Optional[OCRDetection]:
-        """Try to combine raw OCR tokens near the target location."""
-        
-        # Find tokens near target location
-        nearby = []
-        for ocr in raw_ocr:
-            if id(ocr) in used:
-                continue
-            
-            box = ocr.bounding_box
-            cx = (box["xmin"] + box["xmax"]) / 2
-            cy = (box["ymin"] + box["ymax"]) / 2
-            
-            dist = ((cx - target_x) ** 2 + (cy - target_y) ** 2) ** 0.5
-            if dist < 150:  # Within range
-                nearby.append((ocr, dist))
-        
-        if not nearby:
-            return None
-        
-        # Sort by distance
-        nearby.sort(key=lambda x: x[1])
-        
-        # Take closest few and check if they form the target
-        candidates = [n[0] for n in nearby[:6]]
-        
-        # Try to match
-        target_norm = self._normalize(gem.value)
-        
-        for size in range(len(candidates), 0, -1):
-            for combo in self._combinations(candidates, size):
-                combo_sorted = sorted(combo, key=lambda d: (d.bounding_box["ymin"], d.bounding_box["xmin"]))
-                combo_text = " ".join(d.text for d in combo_sorted)
-                combo_norm = self._normalize(combo_text)
-                
-                similarity = SequenceMatcher(None, target_norm, combo_norm).ratio()
-                if similarity > 0.7:
-                    # Create merged detection
-                    return OCRDetection(
-                        text=combo_text,
-                        bounding_box={
-                            "xmin": min(d.bounding_box["xmin"] for d in combo_sorted),
-                            "xmax": max(d.bounding_box["xmax"] for d in combo_sorted),
-                            "ymin": min(d.bounding_box["ymin"] for d in combo_sorted),
-                            "ymax": max(d.bounding_box["ymax"] for d in combo_sorted),
-                        },
-                        confidence=0.7
-                    )
-        
-        return None
-    
-    def _combinations(self, items: list, size: int):
-        """Generate combinations."""
-        if size == 0:
-            yield []
-        elif items:
-            for i, item in enumerate(items):
-                for combo in self._combinations(items[i+1:], size-1):
-                    yield [item] + combo
     
     def _sort_reading_order(self, dims: List[Dimension]) -> List[Dimension]:
         """Sort in reading order."""
