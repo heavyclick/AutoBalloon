@@ -1,6 +1,6 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef } from 'react';
 import { API_BASE_URL } from '../constants/config';
-import { DraggableBalloon } from './DraggableBalloon'; // Extracted small component
+import { DraggableBalloon } from './DraggableBalloon';
 
 export function BlueprintViewer({ 
   imageSrc, 
@@ -26,14 +26,12 @@ export function BlueprintViewer({
     const minY = Math.min(drawing.startY, drawing.currentY);
     const maxY = Math.max(drawing.startY, drawing.currentY);
     
+    setDrawing(null);
+
     // Ignore small accidental clicks
-    if ((maxX - minX) < 1 || (maxY - minY) < 1) {
-        setDrawing(null);
-        return;
-    }
+    if ((maxX - minX) < 1 || (maxY - minY) < 1) return;
 
     // 2. Call Backend Detection (Hybrid: Vector Check -> OCR)
-    // Note: We use the new '/detect-region' endpoint you set up
     try {
         const cropPayload = {
             image: imageSrc.split(',')[1], // Base64
@@ -64,15 +62,13 @@ export function BlueprintViewer({
         
     } catch (e) {
         console.error("Detection failed", e);
-    } finally {
-        setDrawing(null);
     }
   };
 
   return (
     <div 
         ref={containerRef}
-        className="relative w-full h-full select-none cursor-crosshair"
+        className="relative w-full h-full select-none cursor-crosshair min-h-[500px]"
         onMouseDown={(e) => {
             const rect = containerRef.current.getBoundingClientRect();
             const x = ((e.clientX - rect.left) / rect.width) * 100;
@@ -87,16 +83,23 @@ export function BlueprintViewer({
             setDrawing(prev => ({ ...prev, currentX: x, currentY: y }));
         }}
         onMouseUp={handleMouseUp}
+        onMouseLeave={() => setDrawing(null)}
     >
-        <img src={imageSrc} className="w-full pointer-events-none" alt="Blueprint" />
+        {imageSrc && <img src={imageSrc} className="w-full pointer-events-none" alt="Blueprint" />}
         
         {/* Render Balloons */}
         {dimensions.map(dim => (
             <DraggableBalloon 
                 key={dim.id}
                 dimension={dim}
+                // Explicitly pass coords
+                left={dim.balloonX}
+                top={dim.balloonY}
                 isSelected={dim.id === selectedDimId}
                 onClick={() => onSelect(dim.id)}
+                // Required props for dragging/deleting
+                containerRef={containerRef}
+                onDelete={onDelete}
                 onDrag={(dx, dy) => onUpdate({...dim, balloonX: dim.balloonX + dx, balloonY: dim.balloonY + dy})}
             />
         ))}
