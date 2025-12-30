@@ -73,7 +73,13 @@ class ParsedValues(BaseModel):
     min_limit: float
     precision: int = 3
     units: str = "in"  # 'in' or 'mm'
-    tolerance_type: str = "bilateral" # 'bilateral', 'limit', 'basic', 'max', 'min', 'gdt'
+    tolerance_type: str = "bilateral" # 'bilateral', 'limit', 'basic', 'max', 'min', 'gdt', 'fit'
+    
+    # New Engineering Fields
+    quantity: int = 1
+    subtype: str = "Linear" # 'Linear', 'Diameter', 'Radius', 'Chamfer', 'Angle', 'Note'
+    fit_class: Optional[str] = None # e.g., 'H7', 'g6'
+    inspection_method: Optional[str] = None # e.g., 'CMM', 'Caliper'
     
     # GD&T Specific Fields
     is_gdt: bool = False
