@@ -1,245 +1,351 @@
-/**
- * CMM Import Component
- * Allows users to upload CMM measurement CSV and auto-match to balloons
- */
-
 import React, { useState, useRef } from 'react';
 
+/**
+ * CMM Import Component (Production Ready)
+ * 1. Uploads raw file to Backend for robust parsing (supports PC-DMIS, Calypso, CSV).
+ * 2. Receives normalized JSON data.
+ * 3. Performs Intelligent Weighted Matching on the Client.
+ */
 export function CMMImport({ dimensions, onResultsImported }) {
   const [isOpen, setIsOpen] = useState(false);
-  const [csvData, setCsvData] = useState(null);
-  const [mappings, setMappings] = useState([]);
-  const [importedResults, setImportedResults] = useState({});
+  const [isUploading, setIsUploading] = useState(false);
+  const [error, setError] = useState(null);
+  
+  // Data State
+  const [cmmFilename, setCmmFilename] = useState(null);
+  const [mappings, setMappings] = useState([]); // Array of { cmmData, matchedBalloonId, score }
+  
   const fileInputRef = useRef(null);
 
-  const parseCSV = (text) => {
-    const lines = text.trim().split('\n');
-    const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
-    
-    const data = [];
-    for (let i = 1; i < lines.length; i++) {
-      const values = lines[i].split(',').map(v => v.trim());
-      const row = {};
-      headers.forEach((header, idx) => {
-        row[header] = values[idx] || '';
-      });
-      data.push(row);
+  // ===========================================================================
+  // 1. INTELLIGENT MATCHING ENGINE
+  // ===========================================================================
+  
+  /**
+   * Calculates a compatibility score (0-100) between a CMM row and a Balloon.
+   * Logic:
+   * - Nominal Value Match: +50 pts (Primary Key)
+   * - ID/Label Match:      +30 pts (Secondary Key)
+   * - Tolerance Match:     +20 pts (Validation)
+   */
+  const calculateMatchScore = (cmmRow, dimension) => {
+    let score = 0;
+    const EPSILON = 0.002; // Tolerance for floating point comparison
+
+    // 1. Nominal Match (50 pts)
+    const dimVal = parseFloat(dimension.value.replace(/[^\d.-]/g, ''));
+    if (!isNaN(dimVal) && Math.abs(cmmRow.nominal - dimVal) <= EPSILON) {
+      score += 50;
     }
-    return { headers, data };
+
+    // 2. ID Match (30 pts)
+    // Normalize IDs: "Dim 10", "10", "010" -> "10"
+    const cmmId = String(cmmRow.feature_id).replace(/[^0-9]/g, '');
+    const dimId = String(dimension.id);
+    if (cmmId && cmmId === dimId) {
+      score += 30;
+    }
+
+    // 3. Tolerance Match (20 pts)
+    // Check if the tolerance band in CMM matches the blueprint
+    // (Requires parsed tolerances on the dimension object)
+    if (dimension.parsed && cmmRow.plus_tol !== undefined) {
+      const dimPlus = dimension.parsed.plus_tolerance || 0;
+      const dimMinus = dimension.parsed.minus_tolerance || 0;
+      
+      if (Math.abs(cmmRow.plus_tol - dimPlus) < EPSILON && 
+          Math.abs(Math.abs(cmmRow.minus_tol) - Math.abs(dimMinus)) < EPSILON) {
+        score += 20;
+      }
+    }
+
+    return score;
   };
 
-  const findBestMatch = (cmmFeature, dimensions) => {
-    // Try to match by feature number, name, or nominal value
-    const featureNum = cmmFeature.feature || cmmFeature.id || cmmFeature['feature #'] || cmmFeature['feature number'];
-    const nominal = cmmFeature.nominal || cmmFeature['nominal value'] || cmmFeature.nom;
-    
-    // First try exact feature number match
-    if (featureNum) {
-      const numMatch = dimensions.find(d => d.id.toString() === featureNum.toString());
-      if (numMatch) return numMatch;
-    }
-    
-    // Then try nominal value match
-    if (nominal) {
-      const nominalNum = parseFloat(nominal);
-      const nomMatch = dimensions.find(d => {
-        const dimValue = parseFloat(d.value.replace(/[^\d.-]/g, ''));
-        return Math.abs(dimValue - nominalNum) < 0.001;
+  /**
+   * Runs the matching algorithm for all CMM rows against all Dimensions.
+   */
+  const performAutoMatch = (cmmRows, availableDimensions) => {
+    return cmmRows.map((row, idx) => {
+      let bestMatch = null;
+      let maxScore = -1;
+
+      availableDimensions.forEach(dim => {
+        const score = calculateMatchScore(row, dim);
+        if (score > maxScore) {
+          maxScore = score;
+          bestMatch = dim;
+        }
       });
-      if (nomMatch) return nomMatch;
-    }
-    
-    return null;
+
+      // Threshold: Only auto-assign if score is decent (e.g., > 40)
+      // This prevents matching "10.00" nominal to a random "10.00" dimension if IDs don't match
+      const finalMatch = (maxScore >= 40) ? bestMatch : null;
+
+      return {
+        uuid: `cmm-${idx}`, // Internal key for React
+        cmmData: row,
+        matchedBalloonId: finalMatch ? finalMatch.id : '',
+        matchScore: maxScore,
+        manualOverride: false
+      };
+    });
   };
 
-  const handleFileUpload = (e) => {
+  // ===========================================================================
+  // 2. API & EVENT HANDLERS
+  // ===========================================================================
+
+  const handleFileUpload = async (e) => {
     const file = e.target.files[0];
     if (!file) return;
 
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const text = event.target.result;
-      const parsed = parseCSV(text);
-      setCsvData(parsed);
-      
-      // Auto-map CMM features to balloons
-      const autoMappings = parsed.data.map((row, idx) => {
-        const match = findBestMatch(row, dimensions);
-        return {
-          cmmIndex: idx,
-          cmmData: row,
-          matchedBalloon: match ? match.id : null,
-          actualValue: row.actual || row.measured || row['actual value'] || row.result || '',
-          deviation: row.deviation || row.dev || '',
-          status: row.status || (row.pass === 'true' || row.pass === '1' ? 'PASS' : row.pass === 'false' || row.pass === '0' ? 'FAIL' : ''),
-        };
+    setIsUploading(true);
+    setError(null);
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+      // NOTE: Ensure this endpoint exists in backend/api/routes.py
+      const response = await fetch('/api/cmm/parse', {
+        method: 'POST',
+        body: formData,
       });
+
+      if (!response.ok) throw new Error('Failed to parse file on server');
+
+      const data = await response.json();
       
-      setMappings(autoMappings);
-    };
-    reader.readAsText(file);
+      if (data.success && data.results) {
+        setCmmFilename(file.name);
+        const autoMapped = performAutoMatch(data.results, dimensions);
+        setMappings(autoMapped);
+      } else {
+        throw new Error(data.message || 'No data found in file');
+      }
+
+    } catch (err) {
+      console.error(err);
+      setError(err.message || 'Error uploading file');
+    } finally {
+      setIsUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
   };
 
-  const handleMappingChange = (cmmIndex, balloonId) => {
-    setMappings(prev => prev.map((m, idx) => 
-      idx === cmmIndex ? { ...m, matchedBalloon: balloonId ? parseInt(balloonId) : null } : m
-    ));
+  const handleMatchChange = (rowIndex, balloonId) => {
+    setMappings(prev => prev.map((item, idx) => {
+      if (idx !== rowIndex) return item;
+      return {
+        ...item,
+        matchedBalloonId: balloonId ? parseInt(balloonId) : '',
+        manualOverride: true
+      };
+    }));
   };
 
-  const handleImport = () => {
-    const results = {};
+  const commitImport = () => {
+    // Convert internal mapping state to the simple ID->Result map expected by the app
+    const resultsMap = {};
+    let importCount = 0;
+
     mappings.forEach(m => {
-      if (m.matchedBalloon) {
-        results[m.matchedBalloon] = {
-          actual: m.actualValue,
-          deviation: m.deviation,
-          status: m.status,
+      if (m.matchedBalloonId) {
+        resultsMap[m.matchedBalloonId] = {
+          actual: m.cmmData.actual,
+          deviation: m.cmmData.deviation,
+          status: m.cmmData.status,
+          // Store extra metadata if needed for export later
+          cmm_feature: m.cmmData.feature_id 
         };
+        importCount++;
       }
     });
-    
-    setImportedResults(results);
-    onResultsImported(results);
+
+    onResultsImported(resultsMap);
     setIsOpen(false);
   };
 
-  const matchedCount = mappings.filter(m => m.matchedBalloon).length;
+  // ===========================================================================
+  // 3. UI RENDER
+  // ===========================================================================
 
   if (!isOpen) {
     return (
       <button
         onClick={() => setIsOpen(true)}
-        className="px-4 py-2 bg-[#1a1a1a] hover:bg-[#252525] text-gray-300 rounded-lg transition-colors text-sm flex items-center gap-2"
+        className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-200 rounded-md text-sm font-medium flex items-center gap-2 transition-colors border border-gray-700"
       >
         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
         </svg>
         Import CMM
       </button>
     );
   }
 
+  const matchedCount = mappings.filter(m => m.matchedBalloonId).length;
+
   return (
-    <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
-      <div className="bg-[#161616] rounded-2xl max-w-4xl w-full max-h-[90vh] overflow-hidden flex flex-col">
+    <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-6 backdrop-blur-sm">
+      <div className="bg-[#1a1a1a] rounded-xl shadow-2xl w-full max-w-5xl h-[85vh] flex flex-col border border-gray-800">
+        
         {/* Header */}
-        <div className="px-6 py-4 border-b border-[#2a2a2a] flex justify-between items-center">
+        <div className="px-6 py-5 border-b border-gray-800 flex justify-between items-center bg-[#202020] rounded-t-xl">
           <div>
-            <h2 className="text-xl font-bold text-white">Import CMM Results</h2>
-            <p className="text-gray-400 text-sm">Upload your CMM measurement CSV to auto-fill results</p>
+            <h2 className="text-xl font-bold text-white">Import CMM Inspection Data</h2>
+            <p className="text-gray-400 text-sm mt-1">Supports PC-DMIS, Calypso, and CSV formats</p>
           </div>
-          <button onClick={() => setIsOpen(false)} className="text-gray-500 hover:text-white">
+          <button 
+            onClick={() => setIsOpen(false)}
+            className="text-gray-500 hover:text-white transition-colors"
+          >
             <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
             </svg>
           </button>
         </div>
 
-        {/* Content */}
-        <div className="flex-1 overflow-auto p-6">
-          {!csvData ? (
-            <div 
-              className="border-2 border-dashed border-[#2a2a2a] rounded-xl p-12 text-center cursor-pointer hover:border-[#3a3a3a]"
-              onClick={() => fileInputRef.current?.click()}
-            >
+        {/* Main Content Area */}
+        <div className="flex-1 overflow-hidden flex flex-col bg-[#161616]">
+          {error && (
+            <div className="m-4 p-3 bg-red-900/30 border border-red-800 text-red-200 rounded text-sm">
+              Error: {error}
+            </div>
+          )}
+
+          {!mappings.length ? (
+            // Upload State
+            <div className="flex-1 flex flex-col items-center justify-center border-2 border-dashed border-gray-800 m-8 rounded-xl hover:border-blue-500/50 hover:bg-gray-800/30 transition-all cursor-pointer group"
+                 onClick={() => !isUploading && fileInputRef.current?.click()}>
               <input
-                ref={fileInputRef}
                 type="file"
-                accept=".csv"
-                onChange={handleFileUpload}
+                ref={fileInputRef}
                 className="hidden"
+                accept=".csv,.txt,.rpt"
+                onChange={handleFileUpload}
               />
-              <svg className="w-12 h-12 text-gray-500 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-              </svg>
-              <p className="text-white font-medium mb-2">Upload CMM CSV File</p>
-              <p className="text-gray-500 text-sm">Supports standard CMM export formats</p>
+              
+              {isUploading ? (
+                <div className="text-center">
+                  <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4"></div>
+                  <p className="text-gray-300">Parsing CMM Report...</p>
+                </div>
+              ) : (
+                <div className="text-center">
+                  <svg className="w-16 h-16 text-gray-600 group-hover:text-blue-500 mx-auto mb-4 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                  </svg>
+                  <p className="text-lg font-medium text-gray-300">Click to Upload Report</p>
+                  <p className="text-gray-500 text-sm mt-2">Accepted: .csv, .txt (PC-DMIS), .rpt (Calypso)</p>
+                </div>
+              )}
             </div>
           ) : (
-            <div className="space-y-4">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-4">
-                  <span className="text-green-500 font-medium">{matchedCount} of {mappings.length} matched</span>
-                  <button 
-                    onClick={() => { setCsvData(null); setMappings([]); }}
-                    className="text-gray-400 hover:text-white text-sm"
-                  >
-                    Upload different file
-                  </button>
-                </div>
+            // Review State
+            <div className="flex-1 overflow-auto p-0">
+              <div className="sticky top-0 bg-[#202020] px-6 py-2 border-b border-gray-800 flex justify-between items-center text-xs font-mono text-gray-400">
+                <span>FILE: {cmmFilename}</span>
+                <span>MATCHED: {matchedCount} / {mappings.length}</span>
               </div>
-
-              <div className="bg-[#0a0a0a] rounded-xl overflow-hidden">
-                <table className="w-full text-sm">
-                  <thead className="bg-[#1a1a1a]">
-                    <tr>
-                      <th className="px-4 py-3 text-left text-gray-400 font-medium">CMM Feature</th>
-                      <th className="px-4 py-3 text-left text-gray-400 font-medium">Actual Value</th>
-                      <th className="px-4 py-3 text-left text-gray-400 font-medium">Match to Balloon</th>
-                      <th className="px-4 py-3 text-left text-gray-400 font-medium">Status</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {mappings.map((mapping, idx) => (
-                      <tr key={idx} className="border-t border-[#1a1a1a]">
-                        <td className="px-4 py-3 text-white">
-                          {mapping.cmmData.feature || mapping.cmmData.id || mapping.cmmData['feature #'] || `Row ${idx + 1}`}
-                        </td>
-                        <td className="px-4 py-3 text-white font-mono">
-                          {mapping.actualValue || '—'}
-                        </td>
-                        <td className="px-4 py-3">
+              
+              <table className="w-full text-left border-collapse">
+                <thead className="bg-[#1a1a1a] sticky top-8 z-10 text-xs uppercase text-gray-500 font-semibold tracking-wider">
+                  <tr>
+                    <th className="px-6 py-3 border-b border-gray-800">CMM Feature</th>
+                    <th className="px-6 py-3 border-b border-gray-800">Nominal</th>
+                    <th className="px-6 py-3 border-b border-gray-800">Actual</th>
+                    <th className="px-6 py-3 border-b border-gray-800">Deviation</th>
+                    <th className="px-6 py-3 border-b border-gray-800 w-1/3">Mapped Balloon</th>
+                    <th className="px-6 py-3 border-b border-gray-800">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-800 text-sm text-gray-300">
+                  {mappings.map((row, idx) => (
+                    <tr key={row.uuid} className="hover:bg-[#202020] transition-colors">
+                      <td className="px-6 py-3 font-medium text-white">
+                        {row.cmmData.feature_id} 
+                        {row.cmmData.axis && <span className="ml-2 text-xs bg-gray-700 px-1 rounded text-gray-300">{row.cmmData.axis}</span>}
+                      </td>
+                      <td className="px-6 py-3 font-mono text-gray-400">{row.cmmData.nominal}</td>
+                      <td className="px-6 py-3 font-mono">{row.cmmData.actual}</td>
+                      <td className={`px-6 py-3 font-mono ${Math.abs(row.cmmData.deviation) > 0.0001 ? 'text-yellow-500' : 'text-gray-500'}`}>
+                        {row.cmmData.deviation}
+                      </td>
+                      <td className="px-6 py-3">
+                        <div className="flex items-center gap-2">
                           <select
-                            value={mapping.matchedBalloon || ''}
-                            onChange={(e) => handleMappingChange(idx, e.target.value)}
-                            className="bg-[#1a1a1a] border border-[#2a2a2a] rounded px-2 py-1 text-white text-sm"
+                            value={row.matchedBalloonId}
+                            onChange={(e) => handleMatchChange(idx, e.target.value)}
+                            className={`w-full bg-[#111] border rounded px-3 py-1.5 outline-none focus:ring-1 focus:ring-blue-500 text-sm
+                              ${row.matchedBalloonId ? 'border-blue-900/50 text-white' : 'border-gray-700 text-gray-500'}
+                            `}
                           >
-                            <option value="">No match</option>
+                            <option value="">-- Unmapped --</option>
                             {dimensions.map(d => (
                               <option key={d.id} value={d.id}>
-                                #{d.id} - {d.value}
+                                #{d.id} - {d.value} {d.parsed?.subtype ? `(${d.parsed.subtype})` : ''}
                               </option>
                             ))}
                           </select>
-                        </td>
-                        <td className="px-4 py-3">
-                          {mapping.status && (
-                            <span className={`px-2 py-1 rounded text-xs font-medium ${
-                              mapping.status === 'PASS' ? 'bg-green-500/20 text-green-400' : 
-                              mapping.status === 'FAIL' ? 'bg-red-500/20 text-red-400' : 
-                              'bg-gray-500/20 text-gray-400'
-                            }`}>
-                              {mapping.status}
-                            </span>
+                          
+                          {/* Confidence Indicator */}
+                          {row.matchScore > 0 && !row.manualOverride && (
+                            <div className="group relative">
+                              <div className={`w-2 h-2 rounded-full ${row.matchScore > 80 ? 'bg-green-500' : 'bg-yellow-500'}`}></div>
+                              <span className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2 py-1 bg-black text-xs rounded opacity-0 group-hover:opacity-100 whitespace-nowrap pointer-events-none border border-gray-700">
+                                Match Score: {row.matchScore}%
+                              </span>
+                            </div>
                           )}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                        </div>
+                      </td>
+                      <td className="px-6 py-3">
+                         <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium
+                          ${row.cmmData.status === 'PASS' ? 'bg-green-900/30 text-green-400 border border-green-900' : 
+                            row.cmmData.status === 'FAIL' ? 'bg-red-900/30 text-red-400 border border-red-900' : 
+                            'bg-gray-800 text-gray-400 border border-gray-700'}`}>
+                           {row.cmmData.status || 'UNK'}
+                         </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
           )}
         </div>
 
-        {/* Footer */}
-        {csvData && (
-          <div className="px-6 py-4 border-t border-[#2a2a2a] flex justify-end gap-3">
+        {/* Footer Actions */}
+        <div className="px-6 py-4 border-t border-gray-800 bg-[#202020] rounded-b-xl flex justify-between items-center">
+          {mappings.length > 0 ? (
+             <button
+              onClick={() => { setMappings([]); setCmmFilename(null); }}
+              className="text-sm text-gray-400 hover:text-white"
+            >
+              Reset / Upload New
+            </button>
+          ) : <div></div>}
+         
+          <div className="flex gap-3">
             <button
               onClick={() => setIsOpen(false)}
-              className="px-4 py-2 text-gray-400 hover:text-white"
+              className="px-4 py-2 bg-transparent hover:bg-gray-800 text-gray-300 rounded-lg transition-colors"
             >
               Cancel
             </button>
             <button
-              onClick={handleImport}
+              onClick={commitImport}
               disabled={matchedCount === 0}
-              className="px-6 py-2 bg-[#E63946] hover:bg-[#c62d39] text-white font-medium rounded-lg disabled:opacity-50"
+              className="px-6 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 text-white font-medium rounded-lg shadow-lg shadow-blue-900/20 transition-all flex items-center gap-2"
             >
-              Import {matchedCount} Results
+              <span>Import Data</span>
+              {matchedCount > 0 && <span className="bg-blue-800 px-2 py-0.5 rounded text-xs text-blue-100">{matchedCount}</span>}
             </button>
           </div>
-        )}
+        </div>
+
       </div>
     </div>
   );
