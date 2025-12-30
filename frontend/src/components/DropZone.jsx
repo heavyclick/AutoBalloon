@@ -5,6 +5,8 @@
  * 2. Snippet Verification Sidebar (Speed check)
  * 3. Confidence Heatmap (Green/Yellow/Red)
  * 4. Local Project Saving (.ab files via JSZip)
+ * 5. CMM Import: Raw Text Support & Weighted Scoring
+ * 6. Revision Compare: Balloon Porting Workflow
  * * PREVIOUS FIXES:
  * 1. 422 Error Fix
  * 2. Invisible Bridge Tooltip
@@ -65,12 +67,16 @@ export function DropZone({ onBeforeProcess, hasPromoAccess = false, userEmail = 
     
     try {
       const formData = new FormData();
+      // Ensure file is sent as binary for backend Vector/PDF extraction
       formData.append('file', file);
       if (!token) formData.append('visitor_id', visitorId);
+      
       const headers = {};
       if (token) headers['Authorization'] = `Bearer ${token}`;
+      
       const response = await fetch(`${API_BASE_URL}/process`, { method: 'POST', headers, body: formData });
       const data = await response.json();
+      
       if (data.success) {
         if (data.pages && data.pages.length > 0) {
           setTotalPages(data.total_pages || data.pages.length);
@@ -151,7 +157,17 @@ export function DropZone({ onBeforeProcess, hasPromoAccess = false, userEmail = 
     return result.dimensions?.length || 0;
   };
 
-  if (showRevisionCompare) return <RevisionCompare onClose={() => setShowRevisionCompare(false)} onComplete={handleRevisionCompareResult} visitorId={visitorId} incrementUsage={incrementUsage} isPro={canDownload} onShowGlassWall={() => setShowGlassWall(true)} />;
+  if (showRevisionCompare) return (
+    <RevisionCompare 
+        onClose={() => setShowRevisionCompare(false)} 
+        onComplete={handleRevisionCompareResult} 
+        visitorId={visitorId} 
+        incrementUsage={incrementUsage} 
+        isPro={canDownload} 
+        onShowGlassWall={() => setShowGlassWall(true)} 
+        token={token}
+    />
+  );
   
   if (result) return (
     <>
@@ -207,7 +223,7 @@ export function DropZone({ onBeforeProcess, hasPromoAccess = false, userEmail = 
             </div>
             <p className="text-xl font-medium text-white mb-2">{isDragging ? 'Drop your file here' : 'Drag & drop your blueprint'}</p>
             <p className="text-gray-400 mb-4">or <span className="text-[#E63946]">click to browse</span></p>
-            <p className="text-gray-500 text-sm">PDF (multi-page), PNG, JPEG, TIFF</p>
+            <p className="text-gray-500 text-sm">PDF (Vector/OCR), PNG, JPEG, TIFF</p>
           </div>
         )}
         {error && <div className="absolute inset-x-0 bottom-4 text-center"><p className="text-red-500 text-sm">{error}</p></div>}
@@ -217,10 +233,11 @@ export function DropZone({ onBeforeProcess, hasPromoAccess = false, userEmail = 
 }
 
 // ============ REVISION COMPARE ============
-function RevisionCompare({ onClose, onComplete, visitorId, incrementUsage, isPro, onShowGlassWall }) {
+function RevisionCompare({ onClose, onComplete, visitorId, incrementUsage, isPro, onShowGlassWall, token }) {
   const [revA, setRevA] = useState(null);
   const [revB, setRevB] = useState(null);
   const [isComparing, setIsComparing] = useState(false);
+  const [isPorting, setIsPorting] = useState(false);
   const [comparisonResult, setComparisonResult] = useState(null);
   const fileInputARef = useRef(null);
   const fileInputBRef = useRef(null);
@@ -244,13 +261,17 @@ function RevisionCompare({ onClose, onComplete, visitorId, incrementUsage, isPro
         fetch(`${API_BASE_URL}/process`, { method: 'POST', body: formDataB })
       ]);
       const [dataA, dataB] = await Promise.all([responseA.json(), responseB.json()]);
+      
       if (dataA.success && dataB.success) {
         const dimsA = dataA.dimensions || [];
         const dimsB = dataB.dimensions || [];
         const changes = { added: [], removed: [], modified: [], unchanged: [] };
+        
+        // Simple geometric matching for quick visual diff
+        // (Production note: Backend alignment service should be used for better precision)
         const filterTitleBlock = (dims) => dims.filter(d => {
           const centerY = (d.bounding_box.ymin + d.bounding_box.ymax) / 2;
-          return centerY < 800;
+          return centerY < 800; // Rough title block filter
         });
         const filteredA = filterTitleBlock(dimsA);
         const filteredB = filterTitleBlock(dimsB);
@@ -289,6 +310,50 @@ function RevisionCompare({ onClose, onComplete, visitorId, incrementUsage, isPro
     }
   };
 
+  const handlePortBalloons = async () => {
+    if (!isPro) { onShowGlassWall(); return; }
+    if (!comparisonResult) return;
+    
+    setIsPorting(true);
+    try {
+        // In a real implementation, this would call /api/align/port
+        // For now, we simulate the porting by taking Rev A's IDs and applying them to Rev B's matching locations
+        const portedDimensions = [];
+        
+        // 1. Port unchanged/modified dimensions (Maintain IDs from Rev A)
+        comparisonResult.revB.dimensions.forEach(dimB => {
+            const matchA = comparisonResult.revA.dimensions.find(dimA => {
+                 // Simple bounding box overlap check or centroid distance
+                 // Real backend would use vector alignment matrix
+                 const cxA = (dimA.bounding_box.xmin + dimA.bounding_box.xmax) / 2;
+                 const cyA = (dimA.bounding_box.ymin + dimA.bounding_box.ymax) / 2;
+                 const cxB = (dimB.bounding_box.xmin + dimB.bounding_box.xmax) / 2;
+                 const cyB = (dimB.bounding_box.ymin + dimB.bounding_box.ymax) / 2;
+                 return Math.abs(cxA - cxB) < 30 && Math.abs(cyA - cyB) < 30;
+            });
+            
+            if (matchA) {
+                portedDimensions.push({ ...dimB, id: matchA.id }); // Keep old ID
+            } else {
+                // It's a new feature, assign new high ID
+                portedDimensions.push({ ...dimB, id: 9000 + Math.floor(Math.random() * 1000) }); // Temporary ID for new items
+            }
+        });
+
+        onComplete({ 
+            dimensions: portedDimensions.sort((a,b) => a.id - b.id), 
+            image: comparisonResult.revB.image, 
+            metadata: comparisonResult.revB.metadata, 
+            comparison: comparisonResult 
+        });
+        
+    } catch (err) {
+        console.error("Porting failed", err);
+    } finally {
+        setIsPorting(false);
+    }
+  };
+
   const handleUseChanges = () => {
     if (!isPro) { onShowGlassWall(); return; }
     if (comparisonResult && onComplete) {
@@ -303,7 +368,7 @@ function RevisionCompare({ onClose, onComplete, visitorId, incrementUsage, isPro
         <div className="px-6 py-4 border-b border-[#2a2a2a] flex justify-between items-center">
           <div>
             <h2 className="text-xl font-bold text-white"><span className="bg-gradient-to-r from-purple-500 to-pink-500 bg-clip-text text-transparent">Delta FAI</span> - Revision Compare</h2>
-            <p className="text-gray-400 text-sm">Upload two revisions to find only what changed</p>
+            <p className="text-gray-400 text-sm">Upload two revisions to find only what changed or port balloons</p>
           </div>
           <button onClick={onClose} className="text-gray-500 hover:text-white"><svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg></button>
         </div>
@@ -353,11 +418,18 @@ function RevisionCompare({ onClose, onComplete, visitorId, incrementUsage, isPro
               {isComparing ? <><svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>Comparing...</> : 'Compare Revisions'}
             </button></>
           ) : (
-            <><button onClick={() => setComparisonResult(null)} className="text-gray-400 hover:text-white">Compare Different Files</button>
-            <button onClick={handleUseChanges} className="px-6 py-2 bg-[#E63946] hover:bg-[#c62d39] text-white font-medium rounded-lg flex items-center gap-2">
-              {!isPro && <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>}
-              Balloon Only Changes ({comparisonResult.summary.added + comparisonResult.summary.modified})
-            </button></>
+            <div className="flex gap-4 w-full justify-between items-center">
+              <button onClick={() => setComparisonResult(null)} className="text-gray-400 hover:text-white">Compare Different Files</button>
+              <div className="flex gap-2">
+                 <button onClick={handlePortBalloons} disabled={isPorting} className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg flex items-center gap-2">
+                    {isPorting ? "Porting..." : "Port Balloons to Rev B"}
+                 </button>
+                 <button onClick={handleUseChanges} className="px-6 py-2 bg-[#E63946] hover:bg-[#c62d39] text-white font-medium rounded-lg flex items-center gap-2">
+                  {!isPro && <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>}
+                  Just Changes ({comparisonResult.summary.added + comparisonResult.summary.modified})
+                 </button>
+              </div>
+            </div>
           )}
         </div>
       </div>
@@ -1516,15 +1588,88 @@ function CMMImportModal({ dimensions, onClose, onImport }) {
   const [mappings, setMappings] = useState([]);
   const fileInputRef = useRef(null);
 
-  const parseCSV = (text) => {
-    const lines = text.trim().split('\n');
-    const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
-    return lines.slice(1).map(line => {
-      const values = line.split(',').map(v => v.trim());
-      const row = {};
-      headers.forEach((h, i) => row[h] = values[i] || '');
-      return row;
-    });
+  // Helper to calculate match score
+  const calculateMatchScore = (cmmRow, dimension) => {
+    let score = 0;
+    
+    // 1. Nominal Match (50 pts)
+    // Attempt to parse nominal from CMM row
+    const cmmNominal = parseFloat(cmmRow.nominal || cmmRow.nom || cmmRow.theoretical || cmmRow.theo || 0);
+    // Parse nominal from dimension value (remove text chars)
+    const dimNominal = parseFloat(dimension.value.replace(/[^\d.-]/g, ''));
+    
+    if (!isNaN(cmmNominal) && !isNaN(dimNominal) && Math.abs(cmmNominal - dimNominal) < 0.001) {
+        score += 50;
+    }
+    
+    // 2. ID Match (30 pts)
+    const cmmId = (cmmRow.feature || cmmRow.id || cmmRow['feature #'] || '').toString().toLowerCase();
+    const dimId = dimension.id.toString();
+    if (cmmId === dimId || cmmId.endsWith(dimId) || dimId.endsWith(cmmId)) {
+        score += 30;
+    }
+    
+    // 3. Tolerance Match (10 pts)
+    // (Simplified check for now)
+    
+    return score;
+  };
+
+  const parseFileContent = (text, fileName) => {
+    const ext = fileName.split('.').pop().toLowerCase();
+    
+    if (ext === 'csv') {
+        const lines = text.trim().split('\n');
+        const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
+        return lines.slice(1).map(line => {
+            const values = line.split(',').map(v => v.trim());
+            const row = {};
+            headers.forEach((h, i) => row[h] = values[i] || '');
+            return row;
+        });
+    } else {
+        // Basic parser for TXT/RPT files (Tab delimited or whitespace)
+        // This is a simple frontend implementation. 
+        // Ideally, this should use the backend 'Parser Factory' service.
+        const lines = text.trim().split('\n');
+        const parsedRows = [];
+        let headers = [];
+        
+        // Try to find a header line
+        const headerIndex = lines.findIndex(l => 
+            l.toLowerCase().includes('feature') || 
+            l.toLowerCase().includes('actual') || 
+            l.toLowerCase().includes('meas')
+        );
+        
+        if (headerIndex >= 0) {
+            // Assume tab or multiple spaces
+            headers = lines[headerIndex].split(/[\t,]+|\s{2,}/).map(h => h.trim().toLowerCase()).filter(Boolean);
+            
+            for (let i = headerIndex + 1; i < lines.length; i++) {
+                if (!lines[i].trim()) continue;
+                const values = lines[i].split(/[\t,]+|\s{2,}/).map(v => v.trim()).filter(Boolean);
+                if (values.length >= Math.min(3, headers.length)) {
+                    const row = {};
+                    // Best effort mapping
+                    headers.forEach((h, idx) => {
+                        if (values[idx]) row[h] = values[idx];
+                    });
+                    
+                    // If no explicit feature ID, use implicit index or first col
+                    if (!row.feature && !row.id) row.feature = values[0];
+                    if (!row.actual && !row.measured) {
+                        // try to find numeric value
+                        const numericVal = values.find(v => !isNaN(parseFloat(v)) && v.includes('.'));
+                        if (numericVal) row.actual = numericVal;
+                    }
+                    
+                    parsedRows.push(row);
+                }
+            }
+        }
+        return parsedRows.length > 0 ? parsedRows : null;
+    }
   };
 
   const handleFileUpload = (e) => {
@@ -1532,17 +1677,33 @@ function CMMImportModal({ dimensions, onClose, onImport }) {
     if (!file) return;
     const reader = new FileReader();
     reader.onload = (event) => {
-      const data = parseCSV(event.target.result);
+      const data = parseFileContent(event.target.result, file.name);
+      if (!data) {
+          alert("Could not parse file. Ensure it has headers like 'Feature', 'Nominal', 'Actual'.");
+          return;
+      }
       setCsvData(data);
+      
       const autoMappings = data.map((row, idx) => {
-        const featureNum = row.feature || row.id || row['feature #'] || row['feature number'] || (idx + 1).toString();
-        const match = dimensions.find(d => d.id.toString() === featureNum.toString());
+        // Find best match using Weighted Scoring
+        let bestMatch = null;
+        let maxScore = 0;
+        
+        dimensions.forEach(dim => {
+            const score = calculateMatchScore(row, dim);
+            if (score > maxScore && score > 20) { // Threshold
+                maxScore = score;
+                bestMatch = dim;
+            }
+        });
+
         return { 
           cmmIndex: idx, 
           cmmData: row, 
-          matchedBalloon: match?.id || null, 
-          actualValue: row.actual || row.measured || row.result || '', 
-          status: row.status || (row.pass === 'true' || row.pass === '1' ? 'PASS' : row.pass === 'false' || row.pass === '0' ? 'FAIL' : '') 
+          matchedBalloon: bestMatch?.id || null, 
+          matchScore: maxScore,
+          actualValue: row.actual || row.measured || row.result || row.axis || '', 
+          status: row.status || (row.pass === 'true' || row.pass === '1' || row.outtol === '0' ? 'PASS' : 'FAIL') // Basic status guess
         };
       });
       setMappings(autoMappings);
@@ -1570,7 +1731,7 @@ function CMMImportModal({ dimensions, onClose, onImport }) {
         <div className="px-6 py-4 border-b border-[#2a2a2a] flex justify-between items-center">
           <div>
             <h2 className="text-xl font-bold text-white">Import CMM Results</h2>
-            <p className="text-gray-400 text-sm">Upload your CMM CSV to auto-fill measurement results</p>
+            <p className="text-gray-400 text-sm">Upload your CMM report to auto-fill measurement results</p>
           </div>
           <button onClick={onClose} className="text-gray-500 hover:text-white">
             <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1584,17 +1745,17 @@ function CMMImportModal({ dimensions, onClose, onImport }) {
               className="border-2 border-dashed border-[#2a2a2a] rounded-xl p-12 text-center cursor-pointer hover:border-[#3a3a3a]" 
               onClick={() => fileInputRef.current?.click()}
             >
-              <input ref={fileInputRef} type="file" accept=".csv" onChange={handleFileUpload} className="hidden" />
+              <input ref={fileInputRef} type="file" accept=".csv,.txt,.rpt" onChange={handleFileUpload} className="hidden" />
               <svg className="w-12 h-12 text-gray-500 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
               </svg>
-              <p className="text-white font-medium mb-2">Upload CMM CSV File</p>
-              <p className="text-gray-500 text-sm">Supports standard CMM export formats</p>
+              <p className="text-white font-medium mb-2">Upload CMM File</p>
+              <p className="text-gray-500 text-sm">Supports CSV, TXT, RPT (PC-DMIS/Calypso)</p>
             </div>
           ) : (
             <div className="space-y-4">
               <div className="flex items-center justify-between">
-                <span className="text-green-500 font-medium">{matchedCount} of {mappings.length} matched</span>
+                <span className="text-green-500 font-medium">{matchedCount} of {mappings.length} matched (Weighted Scoring)</span>
                 <button onClick={() => { setCsvData(null); setMappings([]); }} className="text-gray-400 hover:text-white text-sm">Upload different file</button>
               </div>
               <div className="bg-[#0a0a0a] rounded-xl overflow-hidden max-h-64">
@@ -1610,16 +1771,19 @@ function CMMImportModal({ dimensions, onClose, onImport }) {
                   <tbody>
                     {mappings.map((m, idx) => (
                       <tr key={idx} className="border-t border-[#1a1a1a]">
-                        <td className="px-4 py-3 text-white">{m.cmmData.feature || m.cmmData.id || `Row ${idx + 1}`}</td>
+                        <td className="px-4 py-3 text-white">
+                            {m.cmmData.feature || m.cmmData.id || `Row ${idx + 1}`}
+                            <div className="text-[10px] text-gray-500">Nom: {m.cmmData.nominal || '-'}</div>
+                        </td>
                         <td className="px-4 py-3 text-white font-mono">{m.actualValue || '-'}</td>
                         <td className="px-4 py-3">
                           <select 
                             value={m.matchedBalloon || ''} 
                             onChange={(e) => handleMappingChange(idx, e.target.value)} 
-                            className="bg-[#1a1a1a] border border-[#2a2a2a] rounded px-2 py-1 text-white text-sm"
+                            className={`bg-[#1a1a1a] border rounded px-2 py-1 text-white text-sm ${m.matchScore > 40 ? 'border-green-500/50' : 'border-[#2a2a2a]'}`}
                           >
                             <option value="">No match</option>
-                            {dimensions.map(d => <option key={d.id} value={d.id}>#{d.id} - {d.value}</option>)}
+                            {dimensions.map(d => <option key={d.id} value={d.id}>#{d.id} - {d.value} {m.matchedBalloon === d.id && `(Score: ${m.matchScore})`}</option>)}
                           </select>
                         </td>
                         <td className="px-4 py-3">
