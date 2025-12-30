@@ -6,18 +6,23 @@ Supports:
 - Multi-page PDF extraction (up to 20 pages)
 - High-resolution PNG conversion for each page
 - Single image passthrough
+- Hybrid Vector Text Extraction (extracts selectable text from PDFs)
 
 Uses pdf2image (with poppler backend) for PDF to image conversion.
+Uses pypdf for vector text extraction.
 """
 import io
 import base64
-from typing import Optional, List, Tuple
+import logging
+from typing import Optional, List, Tuple, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
 from PIL import Image
 from pdf2image import convert_from_bytes
 from pypdf import PdfReader
 
+# Configure logger
+logger = logging.getLogger(__name__)
 
 class FileType(Enum):
     """Supported file types"""
@@ -35,6 +40,7 @@ class PageImage:
     width: int
     height: int
     base64_image: str  # For API response
+    vector_text: Optional[List[Dict[str, Any]]] = None  # Extracted text with coordinates
 
 
 @dataclass
@@ -107,15 +113,15 @@ class FileService:
         """
         Process uploaded file, extracting pages as images.
         
-        For PDFs: Converts each page to a high-resolution PNG
-        For images: Returns single page with original image
+        For PDFs: Converts each page to a high-resolution PNG and extracts vector text.
+        For images: Returns single page with original image.
         
         Args:
             file_bytes: Raw file bytes
             filename: Optional filename
             
         Returns:
-            FileProcessingResult with page images
+            FileProcessingResult with page images and text data
         """
         file_type = self.detect_file_type(file_bytes, filename)
         
@@ -134,24 +140,23 @@ class FileService:
     
     def _process_pdf(self, pdf_bytes: bytes) -> FileProcessingResult:
         """
-        Process multi-page PDF, converting each page to PNG.
+        Process multi-page PDF, converting each page to PNG and extracting text.
         
         Args:
             pdf_bytes: Raw PDF file bytes
             
         Returns:
-            FileProcessingResult with all page images
+            FileProcessingResult with all page images and vector data
         """
         try:
-            # Get total page count using pypdf
+            # Initialize pypdf Reader for text extraction
             pdf_reader = PdfReader(io.BytesIO(pdf_bytes))
-            total_pages = len(pdf_reader.pages)
+            total_pages_pdf = len(pdf_reader.pages)
             
             # Determine pages to process
-            pages_to_process = min(total_pages, self.max_pages)
+            pages_to_process = min(total_pages_pdf, self.max_pages)
             
             # Convert PDF pages to images using pdf2image
-            # pdf2image returns a list of PIL Image objects
             pil_images = convert_from_bytes(
                 pdf_bytes,
                 dpi=self.dpi,
@@ -160,9 +165,45 @@ class FileService:
                 fmt='png'
             )
             
-            # Convert each PIL image to our PageImage format
             pages = []
-            for page_num, pil_img in enumerate(pil_images, start=1):
+            for i, pil_img in enumerate(pil_images):
+                page_num = i + 1
+                
+                # --- Vector Text Extraction (Hybrid Engine) ---
+                vector_data = []
+                try:
+                    pypdf_page = pdf_reader.pages[i]
+                    
+                    # Visitor function to extract text and bounding boxes
+                    def visitor_body(text, cm, tm, fontDict, fontSize):
+                        if text and text.strip():
+                            # Normalize coordinates to 0-1000 scale based on page mediabox
+                            # PDF Coordinates: Origin is Bottom-Left
+                            # System Coordinates: Origin is Top-Left (0-1000)
+                            w = float(pypdf_page.mediabox.width)
+                            h = float(pypdf_page.mediabox.height)
+                            
+                            if w > 0 and h > 0:
+                                x = tm[4]
+                                y = tm[5]
+                                
+                                # Convert to normalized 0-1000 scale
+                                # ymin in image = distance from top
+                                vector_data.append({
+                                    'text': text,
+                                    'bbox': {
+                                        'xmin': (x / w) * 1000,
+                                        'ymin': ((h - y - fontSize) / h) * 1000, # Approx top
+                                        'xmax': ((x + fontSize * len(text) * 0.6) / w) * 1000, # Approx width
+                                        'ymax': ((h - y) / h) * 1000 # Approx bottom (baseline)
+                                    }
+                                })
+                    
+                    pypdf_page.extract_text(visitor_text=visitor_body)
+                except Exception as e:
+                    logger.warning(f"Vector extraction failed for page {page_num}: {e}")
+                # ---------------------------------------------
+
                 # Convert PIL image to PNG bytes
                 png_buffer = io.BytesIO()
                 pil_img.save(png_buffer, format='PNG')
@@ -179,22 +220,24 @@ class FileService:
                     image_bytes=png_bytes,
                     width=width,
                     height=height,
-                    base64_image=base64_image
+                    base64_image=base64_image,
+                    vector_text=vector_data  # Pass extracted data
                 ))
             
             warning_msg = None
-            if total_pages > self.max_pages:
-                warning_msg = f"Processed {pages_to_process} of {total_pages} pages (max {self.max_pages})"
+            if total_pages_pdf > self.max_pages:
+                warning_msg = f"Processed {pages_to_process} of {total_pages_pdf} pages (max {self.max_pages})"
             
             return FileProcessingResult(
                 success=True,
                 file_type=FileType.PDF,
-                total_pages=total_pages,
+                total_pages=total_pages_pdf,
                 pages=pages,
                 error_message=warning_msg
             )
             
         except Exception as e:
+            logger.error(f"Failed to process PDF: {str(e)}")
             return FileProcessingResult(
                 success=False,
                 file_type=FileType.PDF,
@@ -239,7 +282,8 @@ class FileService:
                 image_bytes=png_bytes,
                 width=width,
                 height=height,
-                base64_image=base64_image
+                base64_image=base64_image,
+                vector_text=None # No vector text for images
             )
             
             return FileProcessingResult(
