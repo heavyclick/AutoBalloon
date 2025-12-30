@@ -148,8 +148,6 @@ class AlignmentService:
 
         # --- Step 7: Scale Correction ---
         # The matrix M is for the *scaled* images. We need to adjust it for the *original* coordinates.
-        # This is complex linear algebra: M_final = Scale_A_Inverse * M * Scale_B
-        
         scale_mat_a = np.array([[1/scale_a, 0, 0], [0, 1/scale_a, 0], [0, 0, 1]])
         scale_mat_b = np.array([[scale_b, 0, 0], [0, scale_b, 0], [0, 0, 1]])
         
@@ -167,7 +165,6 @@ class AlignmentService:
         processed_b = []
         
         # Adjustable tolerance for "Same Dimension"
-        # 2% of image width is usually a good dynamic tolerance, but fixed pixel is safer for now
         POSITION_TOLERANCE = 50.0 
 
         for db in dims_b:
@@ -314,7 +311,6 @@ class AlignmentService:
                 stats["removed"] += 1
                 
         # Assign new IDs to 'added' items to ensure valid integers
-        # Start counting from the highest existing ID + 1
         all_ids = [d.id for d in dims_a] + [d.id for d in processed_b if getattr(d, 'id', None)]
         next_id = (max(all_ids) if all_ids else 0) + 1
         
@@ -324,3 +320,6 @@ class AlignmentService:
                 next_id += 1
                 
         return processed_b, removed_dims, stats
+
+# THIS LINE WAS MISSING OR BROKEN IN YOUR UPLOAD:
+alignment_service = AlignmentService()
