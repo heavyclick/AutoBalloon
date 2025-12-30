@@ -812,7 +812,7 @@ class DetectionService:
             r'^\d+\.?\d*["\']?$',       # 0.2, 0.2", 25
             r'^\d+/\d+["\']?$',         # 1/4"
             r'^\d+\s+\d+/\d+["\']?$',   # 3 1/4"
-            r'^\d+\.?\d*(?:in|mm)$',    # 0.2in, 25mm
+            r'^\d+\.?\d*(?:in|mm|ft)$', # 0.2in, 25mm, 6ft <-- ADDED ft
             r'^[ØøR]\d+',               # Ø5, R2.5
         ]
         if any(re.match(p, text, re.IGNORECASE) for p in patterns):
@@ -835,6 +835,8 @@ class DetectionService:
             r'^\d+\s+\d+/\d+["\']$',    # 3 1/4"
             r'^\d+/\d+["\']$',          # 1/4"
             r'^\d+\.?\d*["\']$',        # 0.45"
+            r'^\d+\.?\d*ft$',           # 6ft  <-- ADDED THIS
+            r'^\d+ft\s*cord$',          # 6ft cord <-- ADDED THIS (Specific fix)
             r'^\d+\.\d{2,}(?:in|mm)?$',   # 0.2500in
             r'^[ØøR]\d+\.?\d*["\']?$',    # Ø5
             r'^\d+(?:\.\d+)?\s*mm$',      # 32mm
