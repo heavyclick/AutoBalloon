@@ -21,8 +21,15 @@ from models.schemas import (
 from services.export_service import export_service
 # FIX: Import the alignment service for robust revision comparison
 from services.alignment_service import alignment_service
+# NEW: Import Region Routes for Smart Ballooning
+from api import region_routes
 
 router = APIRouter()  # NO PREFIX - endpoints registered at root, main.py handles routing
+
+# ==================
+# REGISTER SUB-ROUTERS
+# ==================
+router.include_router(region_routes.router, tags=["Region"])
 
 
 # ==================
@@ -105,7 +112,8 @@ async def process_drawing(file: UploadFile = File(...)):
                             "xmax": dim.bounding_box.xmax,
                             "ymax": dim.bounding_box.ymax,
                         },
-                        "confidence": dim.confidence
+                        "confidence": dim.confidence,
+                        "parsed": dim.parsed
                     }
                     for dim in page_result.dimensions
                 ],
@@ -126,7 +134,8 @@ async def process_drawing(file: UploadFile = File(...)):
                     "xmax": dim.bounding_box.xmax,
                     "ymax": dim.bounding_box.ymax,
                 },
-                "confidence": dim.confidence
+                "confidence": dim.confidence,
+                "parsed": dim.parsed
             }
             for dim in result.all_dimensions
         ]
@@ -146,7 +155,8 @@ async def process_drawing(file: UploadFile = File(...)):
                         "xmax": dim.bounding_box.xmax,
                         "ymax": dim.bounding_box.ymax,
                     },
-                    "confidence": dim.confidence
+                    "confidence": dim.confidence,
+                    "parsed": dim.parsed
                 }
                 for dim in page.dimensions
             ]
@@ -221,7 +231,8 @@ async def compare_revisions(
                     "ymax": dim.bounding_box.ymax,
                 },
                 "zone": dim.zone,
-                "confidence": getattr(dim, "confidence", 0.0)
+                "confidence": getattr(dim, "confidence", 0.0),
+                "parsed": dim.parsed
             }
             for dim in processed_dims_b
         ],
