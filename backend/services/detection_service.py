@@ -7,6 +7,8 @@ Key improvements:
 2. GD&T Decomposition: Breaks down Feature Control Frames
 3. Unit Awareness: Auto-detects Imperial vs Metric pages
 4. Location Matching: Fuses Gemini semantic locations with accurate OCR text
+   - Fixes "Fraction Splitting" (e.g., "5 1/8" vs "1")
+   - Fixes "Balloon Swapping" (e.g., 0.188 snapping to "1")
 5. Custom Grid: Supports dynamic grid recalibration
 """
 import re
@@ -46,6 +48,7 @@ class GeminiDimension:
     x_percent: float
     y_percent: float
     confidence: float
+    matched: bool = False  # Track if this dimension has been used
 
 
 @dataclass
@@ -184,7 +187,7 @@ class DetectionService:
         page_units = self._detect_page_units(raw_ocr)
         debug['detected_units'] = page_units
         
-        # 2. Group OCR intelligently
+        # 2. Group OCR intelligently (FIXED: Aggressive Fraction Merging)
         grouped_ocr = self._group_ocr(raw_ocr)
         debug['grouped_ocr_count'] = len(grouped_ocr)
         debug['grouped_ocr'] = [d.text for d in grouped_ocr]
@@ -196,7 +199,7 @@ class DetectionService:
             for d in gemini_dims
         ]
         
-        # 4. Match using LOCATION-FIRST strategy
+        # 4. Match using LOCATION-FIRST strategy (FIXED: Exclusive Consumption)
         matched = self._match_by_location(grouped_ocr, raw_ocr, gemini_dims)
         debug['matched_count'] = len(matched)
         
@@ -227,10 +230,11 @@ class DetectionService:
             results = await self.vision_service.identify_dimensions_with_locations(image_bytes)
             return [
                 GeminiDimension(
-                    value=d['value'],
+                    value=str(d['value']), # Ensure string
                     x_percent=d.get('x', 50),
                     y_percent=d.get('y', 50),
-                    confidence=d.get('confidence', 0.8)
+                    confidence=d.get('confidence', 0.8),
+                    matched=False
                 )
                 for d in results
             ]
@@ -475,7 +479,7 @@ class DetectionService:
         return f"{cols[col_idx]}{rows[row_idx]}"
 
     # ==========================
-    # CORE GROUPING & MATCHING
+    # CORE GROUPING & MATCHING (FIXED)
     # ==========================
 
     def _group_ocr(self, detections: List[OCRDetection]) -> List[OCRDetection]:
@@ -484,7 +488,7 @@ class DetectionService:
         - Group modifiers (4X) with adjacent dimensions
         - Group vertically stacked text (For 3.0in / Flange OD)
         - Group tolerances with base dimension
-        - DON'T group two separate complete dimensions
+        - Aggressively merge split fractions (e.g. "5" + "1/8" -> "5 1/8")
         """
         if not detections:
             return []
@@ -531,12 +535,45 @@ class DetectionService:
                     continue
                 
                 for g_det in list(group):
-                    if self._should_group(g_det, det, H_THRESH, V_THRESH, V_STACK):
+                    # Check for standard grouping logic
+                    should_group = self._should_group(g_det, det, H_THRESH, V_THRESH, V_STACK)
+                    
+                    # Check for fraction splitting logic (e.g. "5" and "1/8")
+                    if not should_group:
+                        should_group = self._should_group_fraction(g_det, det)
+
+                    if should_group:
                         group.append(det)
                         used.add(i)
                         changed = True
                         break
     
+    def _should_group_fraction(self, det1: OCRDetection, det2: OCRDetection) -> bool:
+        """Specific logic to catch split fractions like '5' and '1/8'."""
+        b1 = det1.bounding_box
+        b2 = det2.bounding_box
+        
+        # Must be very close horizontally
+        h_dist = b2["xmin"] - b1["xmax"]
+        if not (-5 < h_dist < 40): return False
+        
+        # Must overlap vertically
+        v_overlap = min(b1["ymax"], b2["ymax"]) - max(b1["ymin"], b2["ymin"])
+        if v_overlap <= 0: return False
+        
+        t1 = det1.text.strip()
+        t2 = det2.text.strip()
+        
+        # Case: Number followed by Fraction ("5" + "1/8")
+        if t1.replace('.','',1).isdigit() and ('/' in t2 or t2 in ['1/2','1/4','3/4','1/8']):
+            return True
+            
+        # Case: Fraction followed by Unit ("1/2" + "in")
+        if '/' in t1 and t2.lower() in ['in', 'mm', '"', "'"]:
+            return True
+            
+        return False
+
     def _should_group(
         self,
         det1: OCRDetection,
@@ -661,7 +698,7 @@ class DetectionService:
         """Does this look like a dimension value?"""
         text = text.strip()
         patterns = [
-            r'^\d+\.?\d*["\']?$',       # 0.2, 0.2", 25
+            r'^\d+\.?\d*["\']?$',      # 0.2, 0.2", 25
             r'^\d+/\d+["\']?$',         # 1/4"
             r'^\d+\s+\d+/\d+["\']?$',   # 3 1/4"
             r'^\d+\.?\d*(?:in|mm)$',    # 0.2in, 25mm
@@ -731,116 +768,115 @@ class DetectionService:
         gemini_dims: List[GeminiDimension]
     ) -> List[Dimension]:
         """
-        Match Gemini dimensions to OCR using LOCATION as primary factor.
+        Match Gemini dimensions to OCR using LOCATION and EXCLUSIVE CONSUMPTION.
         
-        Strategy:
-        1. First try: Find OCR with BOTH good location AND text match
-        2. Second try: Find OCR with good text match, verify location is reasonable
-        3. Third try: Combine nearby raw OCR tokens
+        Fixes "Balloon Swapping":
+        - Sorts Gemini dimensions by length (Longest first) -> "5 1/8" matches before "1"
+        - Tracks 'used_ocr_ids' so "1" cannot steal the OCR box for "5 1/8"
         """
         matched = []
-        used_ocr_ids = set()
+        used_ocr_ids = set() # Critical: Once an OCR box is used, it is GONE.
         
-        for gem in gemini_dims:
-            # Convert Gemini's percentage to normalized coords (0-1000)
+        # Pass 1: High Confidence Exact Matches (Text + Location)
+        # Sort Gemini dims by length (descending) to match complex strings like "5 1/8" first
+        gemini_dims_sorted = sorted(gemini_dims, key=lambda x: len(x.value), reverse=True)
+        
+        for gem in gemini_dims_sorted:
+            if hasattr(gem, 'matched') and gem.matched: continue
+            
             target_x = gem.x_percent * 10
             target_y = gem.y_percent * 10
             
             best_match = None
-            best_score = 0
+            best_score = -1
             
-            # === STRATEGY 1: Location + Text Combined ===
-            # Find OCR that's close AND has text similarity
             for ocr in grouped_ocr:
-                if id(ocr) in used_ocr_ids:
-                    continue
+                if id(ocr) in used_ocr_ids: continue
                 
-                box = ocr.bounding_box
-                ocr_x = (box["xmin"] + box["xmax"]) / 2
-                ocr_y = (box["ymin"] + box["ymax"]) / 2
-                
-                distance = ((ocr_x - target_x) ** 2 + (ocr_y - target_y) ** 2) ** 0.5
+                # Text Score
                 text_score = self._text_similarity(gem.value, ocr.text)
+                if text_score < 0.8: continue # Must be strong match for Pass 1
                 
-                # MUST have some text relevance - skip completely unrelated text
-                if text_score < 0.15:
-                    continue
+                # Location Score
+                box = ocr.bounding_box
+                cx = (box["xmin"] + box["xmax"]) / 2
+                cy = (box["ymin"] + box["ymax"]) / 2
+                dist = ((cx - target_x)**2 + (cy - target_y)**2)**0.5
                 
-                # Tighter distance threshold: 150 units = 15% of image
-                max_dist = 150
-                location_score = max(0, 1 - (distance / max_dist))
+                if dist > 200: continue # Must be reasonably close
                 
-                # Combined score - require BOTH to be decent
-                if location_score > 0.3 and text_score > 0.3:
-                    combined = (location_score * 0.5) + (text_score * 0.5)
-                    if combined > best_score:
-                        best_score = combined
-                        best_match = ocr
-            
-            # === STRATEGY 2: Prioritize Text Match with Location Verification ===
-            # If no good combined match, find best text match that's reasonably close
-            if not best_match or best_score < 0.5:
-                text_candidates = []
-                for ocr in grouped_ocr:
-                    if id(ocr) in used_ocr_ids:
-                        continue
-                    
-                    text_score = self._text_similarity(gem.value, ocr.text)
-                    if text_score >= 0.5:  # Good text match
-                        box = ocr.bounding_box
-                        ocr_x = (box["xmin"] + box["xmax"]) / 2
-                        ocr_y = (box["ymin"] + box["ymax"]) / 2
-                        distance = ((ocr_x - target_x) ** 2 + (ocr_y - target_y) ** 2) ** 0.5
-                        
-                        # Allow larger distance if text is very similar
-                        max_allowed = 250 if text_score > 0.7 else 200
-                        if distance < max_allowed:
-                            text_candidates.append((ocr, text_score, distance))
+                # Combined Score
+                score = text_score * 2 - (dist / 1000) # Weight text heavily
                 
-                if text_candidates:
-                    # Sort by text score, then by distance
-                    text_candidates.sort(key=lambda x: (-x[1], x[2]))
-                    best_match = text_candidates[0][0]
-                    best_score = text_candidates[0][1]
-            
-            # === STRATEGY 3: Combine Raw OCR Tokens ===
-            if not best_match or best_score < 0.5:
-                combined_match = self._try_combine_nearby(
-                    gem, raw_ocr, target_x, target_y, used_ocr_ids
-                )
-                if combined_match:
-                    # Verify the combined text actually matches
-                    verify_score = self._text_similarity(gem.value, combined_match.text)
-                    if verify_score > 0.5:
-                        best_match = combined_match
-                        best_score = verify_score
-            
-            # === STRATEGY 4: Exact/High Text Match Anywhere ===
-            # Last resort - if there's an exact text match, use it
-            if not best_match or best_score < 0.6:
-                for ocr in grouped_ocr:
-                    if id(ocr) in used_ocr_ids:
-                        continue
-                    
-                    text_score = self._text_similarity(gem.value, ocr.text)
-                    if text_score > 0.85:  # Very high text match
-                        if text_score > best_score:
-                            best_match = ocr
-                            best_score = text_score
+                if score > best_score:
+                    best_score = score
+                    best_match = ocr
             
             if best_match:
                 used_ocr_ids.add(id(best_match))
+                gem.matched = True # Mark gemini dim as handled
+                matched.append(self._create_dimension(gem, best_match))
+
+        # Pass 2: Loose Match (Location Priority) - With Guards!
+        # For items like "0.188" that might have bad OCR
+        for gem in gemini_dims_sorted:
+            if hasattr(gem, 'matched') and gem.matched: continue
+            
+            target_x = gem.x_percent * 10
+            target_y = gem.y_percent * 10
+            
+            best_match = None
+            best_dist = float('inf')
+            
+            for ocr in grouped_ocr:
+                if id(ocr) in used_ocr_ids: continue
+                
+                # GUARD RAIL: Must have SOME text similarity
+                # Prevents "0.188" snapping to "1" just because it's close
+                text_score = self._text_similarity(gem.value, ocr.text)
+                if text_score < 0.3: continue 
+                
+                box = ocr.bounding_box
+                cx = (box["xmin"] + box["xmax"]) / 2
+                cy = (box["ymin"] + box["ymax"]) / 2
+                dist = ((cx - target_x)**2 + (cy - target_y)**2)**0.5
+                
+                if dist < 250 and dist < best_dist:
+                    best_dist = dist
+                    best_match = ocr
+            
+            if best_match:
+                used_ocr_ids.add(id(best_match))
+                matched.append(self._create_dimension(gem, best_match))
+            else:
+                # Fallback: If no OCR match found, create a "floating" balloon at Gemini's location
+                # This is better than placing it on wrong text
                 matched.append(Dimension(
                     id=0,
                     value=gem.value,
                     zone=None,
-                    bounding_box=BoundingBox(**best_match.bounding_box),
-                    confidence=best_score,
+                    bounding_box=BoundingBox(
+                        xmin=target_x-20, xmax=target_x+20,
+                        ymin=target_y-10, ymax=target_y+10,
+                        center_x=target_x, center_y=target_y
+                    ),
+                    confidence=0.5,
                     page=1
                 ))
-        
+
         return matched
-    
+
+    def _create_dimension(self, gem, ocr) -> Dimension:
+        """Helper to create Dimension object."""
+        return Dimension(
+            id=0,
+            value=gem.value,
+            zone=None,
+            bounding_box=BoundingBox(**ocr.bounding_box),
+            confidence=0.9,
+            page=1
+        )
+
     def _text_similarity(self, s1: str, s2: str) -> float:
         """Calculate text similarity."""
         n1 = self._normalize(s1)
@@ -858,9 +894,8 @@ class DetectionService:
         if not text:
             return ""
         n = text.lower()
-        for old, new in [('ø', 'o'), ('"', ''), ("'", ''), (' ', ''), ('–', '-')]:
-            n = n.replace(old, new)
-        return re.sub(r'[^\w.\-+/]', '', n)
+        # Keep only alphanumeric and dots for comparison
+        return re.sub(r'[^\w.]', '', n)
     
     def _try_combine_nearby(
         self,
