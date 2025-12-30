@@ -3,7 +3,7 @@ Pydantic models for AutoBalloon API
 Single source of truth for all data models
 """
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 from enum import Enum
 
@@ -41,6 +41,41 @@ class ExportTemplate(str, Enum):
     """Export templates"""
     SIMPLE = "SIMPLE"
     AS9102_FORM3 = "AS9102_FORM3"
+    PPAP = "PPAP"
+    CUSTOM = "CUSTOM"
+
+
+class ToleranceType(str, Enum):
+    """Types of tolerance specifications"""
+    BILATERAL = "bilateral"
+    LIMIT = "limit"
+    BASIC = "basic"
+    MAX = "max"
+    MIN = "min"
+    GDT = "gdt"
+    FIT = "fit"
+    FLATNESS = "flatness"
+
+
+class FitType(str, Enum):
+    """Type of ISO fit"""
+    HOLE = "Hole"
+    SHAFT = "Shaft"
+    NONE = "None"
+
+
+class FeatureType(str, Enum):
+    """Engineering feature types (Subtypes)"""
+    LINEAR = "Linear"
+    DIAMETER = "Diameter"
+    RADIUS = "Radius"
+    CHAMFER = "Chamfer"
+    ANGLE = "Angle"
+    NOTE = "Note"
+    WELD = "Weld"
+    FINISH = "Finish"
+    GDT = "GD&T"
+    UNKNOWN = "Unknown"
 
 
 # ==================
@@ -67,18 +102,34 @@ class BoundingBox(BaseModel):
 class ParsedValues(BaseModel):
     """Parsed numerical data for validation and export"""
     nominal: float
+    
+    # Tolerancing
+    tolerance_type: ToleranceType = ToleranceType.BILATERAL
+    plus_tolerance: float = 0.0
+    minus_tolerance: float = 0.0
+    upper_limit: float = 0.0
+    lower_limit: float = 0.0
+    
+    # Legacy fields (maintained for backward compatibility)
     upper_tol: float = 0.0
     lower_tol: float = 0.0
-    max_limit: float
-    min_limit: float
+    max_limit: float = 0.0
+    min_limit: float = 0.0
+    
     precision: int = 3
     units: str = "in"  # 'in' or 'mm'
-    tolerance_type: str = "bilateral" # 'bilateral', 'limit', 'basic', 'max', 'min', 'gdt', 'fit'
     
     # New Engineering Fields
     quantity: int = 1
-    subtype: str = "Linear" # 'Linear', 'Diameter', 'Radius', 'Chamfer', 'Angle', 'Note'
-    fit_class: Optional[str] = None # e.g., 'H7', 'g6'
+    subtype: FeatureType = FeatureType.LINEAR
+    
+    # Fits
+    fit_type: Optional[FitType] = None
+    hole_fit_class: Optional[str] = None # e.g., 'H7'
+    shaft_fit_class: Optional[str] = None # e.g., 'g6'
+    
+    # Specifications
+    full_specification: Optional[str] = None
     inspection_method: Optional[str] = None # e.g., 'CMM', 'Caliper'
     
     # GD&T Specific Fields
@@ -100,11 +151,33 @@ class Dimension(BaseModel):
     manually_added: bool = False
     manually_moved: bool = False
     
+    # New Metadata Fields
+    chart_char_id: Optional[str] = None
+    sheet: Optional[str] = None
+    view_name: Optional[str] = None
+    capture_region: Optional[Dict[str, Any]] = None
+    
+    custom_properties: Dict[str, Any] = {}
+    
     # Stores the engineering math data
     parsed: Optional[ParsedValues] = None
     
     class Config:
         from_attributes = True
+
+
+class BillOfMaterialItem(BaseModel):
+    """Item for Bill of Materials (Form 1)"""
+    part_name: str
+    part_number: str
+    qty: str
+
+
+class SpecificationItem(BaseModel):
+    """Item for Specifications (Form 2)"""
+    process: str
+    spec_number: str
+    code: Optional[str] = None
 
 
 class GridInfo(BaseModel):
@@ -173,6 +246,8 @@ class ExportRequest(BaseModel):
     format: ExportFormat
     template: ExportTemplate = ExportTemplate.AS9102_FORM3
     dimensions: List[dict]
+    bom: List[BillOfMaterialItem] = []
+    specifications: List[SpecificationItem] = []
     metadata: Optional[ExportMetadata] = None
     filename: str = "inspection"
     total_pages: int = 1
