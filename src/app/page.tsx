@@ -41,10 +41,9 @@ export default function Home() {
       setMode(currentMode);
 
       // Subscribe to mode changes
-      const unsubscribe = useAppStore.subscribe(
-        (state) => state.mode,
-        (newMode) => setMode(newMode)
-      );
+      const unsubscribe = useAppStore.subscribe((state) => {
+        setMode(state.mode);
+      });
 
       return () => unsubscribe();
     });
