@@ -14,7 +14,7 @@ import { supabase, getCurrentUser, getUsageRecord } from '@/lib/supabase';
 export async function GET(request: NextRequest) {
   try {
     // Get visitor ID from query params (for anonymous users)
-    const visitorId = request.nextUrl.searchParams.get('visitor_id');
+    const visitorId = request.nextUrl.searchParams.get('visitor_id') || undefined;
 
     // Get current user (if authenticated)
     const user = await getCurrentUser();
@@ -102,12 +102,13 @@ export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
     const { visitor_id } = body;
+    const visitorId = visitor_id || undefined;
 
     // Get current user
     const user = await getCurrentUser();
     const userId = user?.id;
 
-    if (!userId && !visitor_id) {
+    if (!userId && !visitorId) {
       return NextResponse.json(
         { error: 'No user ID or visitor ID provided' },
         { status: 400 }
@@ -116,7 +117,7 @@ export async function POST(request: NextRequest) {
 
     // Increment usage
     const { incrementUsage } = await import('@/lib/supabase');
-    const result = await incrementUsage(userId, visitor_id);
+    const result = await incrementUsage(userId, visitorId);
 
     if (!result.success) {
       return NextResponse.json(
