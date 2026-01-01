@@ -3,6 +3,11 @@
 import dynamic from 'next/dynamic';
 import { useEffect, useState } from 'react';
 
+// Force dynamic rendering - no static generation
+export const dynamic = 'force-dynamic';
+export const dynamicParams = true;
+export const revalidate = 0;
+
 // Dynamically import all views with SSR disabled
 const LandingView = dynamic(() => import('@/components/LandingView').then(mod => ({ default: mod.LandingView })), {
   ssr: false,

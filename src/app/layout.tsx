@@ -3,6 +3,11 @@ import './globals.css'
 
 const inter = Inter({ subsets: ['latin'] })
 
+// Force dynamic rendering for all pages
+export const dynamic = 'force-dynamic';
+export const dynamicParams = true;
+export const revalidate = 0;
+
 export const metadata = {
   title: 'AutoBalloon - Canonical Inspection Engine',
   description: 'AI-powered dimension detection for First Article Inspection. Drop a blueprint, get AS9102 reports in seconds.',
