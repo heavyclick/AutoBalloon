@@ -1,6 +1,6 @@
 'use client';
 
-import dynamic from 'next/dynamic';
+import dynamicImport from 'next/dynamic';
 import { useEffect, useState } from 'react';
 
 // Force dynamic rendering - no static generation
@@ -9,16 +9,16 @@ export const dynamicParams = true;
 export const revalidate = 0;
 
 // Dynamically import all views with SSR disabled
-const LandingView = dynamic(() => import('@/components/LandingView').then(mod => ({ default: mod.LandingView })), {
+const LandingView = dynamicImport(() => import('@/components/LandingView').then(mod => ({ default: mod.LandingView })), {
   ssr: false,
   loading: () => <div className="min-h-screen w-full bg-brand-dark flex items-center justify-center"><div className="text-brand-gray-500">Loading...</div></div>
 });
 
-const ProcessingView = dynamic(() => import('@/components/ProcessingView').then(mod => ({ default: mod.ProcessingView })), {
+const ProcessingView = dynamicImport(() => import('@/components/ProcessingView').then(mod => ({ default: mod.ProcessingView })), {
   ssr: false,
 });
 
-const WorkbenchView = dynamic(() => import('@/components/WorkbenchView').then(mod => ({ default: mod.WorkbenchView })), {
+const WorkbenchView = dynamicImport(() => import('@/components/WorkbenchView').then(mod => ({ default: mod.WorkbenchView })), {
   ssr: false,
 });
 
