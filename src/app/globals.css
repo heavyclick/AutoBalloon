@@ -13,7 +13,7 @@
   }
 
   body {
-    @apply bg-brand-dark text-foreground;
+    @apply bg-brand-dark text-white;
   }
 }
 
