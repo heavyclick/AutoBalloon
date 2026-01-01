@@ -20,7 +20,6 @@
     "decimal.js": "^10.4.3",
     "exceljs": "^4.4.0",
     "jszip": "^3.10.1",
-    "canvas": "^2.11.2",
     "@supabase/supabase-js": "^2.39.0",
     "react-zoom-pan-pinch": "^3.4.0",
     "clsx": "^2.1.0",
