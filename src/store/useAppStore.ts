@@ -247,15 +247,16 @@ export const useAppStore = create<AppState>()(
       storage: typeof window !== 'undefined'
         ? createJSONStorage(() => localforage)
         : createJSONStorage(() => ({
-            getItem: () => null,
-            setItem: () => {},
-            removeItem: () => {},
+            getItem: async () => null,
+            setItem: async () => {},
+            removeItem: async () => {},
           })),
       partialize: (state) => ({
         // Only persist project data, not UI state
         project: state.project,
         canvas: state.canvas,
       }),
+      skipHydration: typeof window === 'undefined',
     }
   )
 );

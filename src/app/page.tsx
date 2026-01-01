@@ -1,12 +1,10 @@
 'use client';
 
+import { useEffect, useState } from 'react';
 import { useAppStore } from '@/store/useAppStore';
 import { LandingView } from '@/components/LandingView';
 import { ProcessingView } from '@/components/ProcessingView';
 import { WorkbenchView } from '@/components/WorkbenchView';
-
-// Force dynamic rendering to prevent static generation issues with Zustand + IndexedDB
-export const dynamic = 'force-dynamic';
 
 /**
  * The Unified Surface
@@ -19,7 +17,23 @@ export const dynamic = 'force-dynamic';
  * NO NAVIGATION. ONLY TRANSFORMATION.
  */
 export default function Home() {
+  const [mounted, setMounted] = useState(false);
   const mode = useAppStore((state) => state.mode);
+
+  // Only render after client-side hydration to avoid SSR issues
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  if (!mounted) {
+    return (
+      <main className="min-h-screen w-full overflow-hidden bg-brand-dark">
+        <div className="flex items-center justify-center min-h-screen">
+          <div className="text-brand-gray-500">Loading...</div>
+        </div>
+      </main>
+    );
+  }
 
   return (
     <main className="min-h-screen w-full overflow-hidden">
