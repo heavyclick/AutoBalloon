@@ -112,8 +112,9 @@ export async function POST(request: NextRequest) {
 
       if (!targetUserId && customerEmail) {
         // Try to find user by email
-        const { data: authUser } = await supabase.auth.admin.getUserByEmail(customerEmail);
-        targetUserId = authUser?.user?.id;
+        const { data: { users } } = await supabase.auth.admin.listUsers();
+        const authUser = users?.find(u => u.email === customerEmail);
+        targetUserId = authUser?.id;
       }
 
       if (!targetUserId) {
