@@ -19,7 +19,8 @@ import { useAppStore } from '@/store/useAppStore';
 import type { Page } from '@/store/useAppStore';
 
 // Configure pdf.js worker
-pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+// Use .mjs for pdfjs-dist v4+
+pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
 
 interface VectorText {
   text: string;
