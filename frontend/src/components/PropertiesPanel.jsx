@@ -279,11 +279,11 @@ export function PropertiesPanel({ selectedDimension, onUpdate }) {
           <div className="bg-[#222] rounded p-2 mt-2 border border-[#333]">
             <div className="flex justify-between text-xs mb-1">
               <span className="text-gray-500">Upper Limit:</span>
-              <span className="text-green-400 font-mono">{getVal('upper_limit', 0).toFixed(4)}</span>
+              <span className="text-green-400 font-mono">{getVal('max_limit', 0).toFixed(4)}</span>
             </div>
             <div className="flex justify-between text-xs">
               <span className="text-gray-500">Lower Limit:</span>
-              <span className="text-green-400 font-mono">{getVal('lower_limit', 0).toFixed(4)}</span>
+              <span className="text-green-400 font-mono">{getVal('min_limit', 0).toFixed(4)}</span>
             </div>
           </div>
         </div>
