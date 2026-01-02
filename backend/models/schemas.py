@@ -159,10 +159,14 @@ class Dimension(BaseModel):
     capture_region: Optional[Dict[str, Any]] = None
     
     custom_properties: Dict[str, Any] = {}
-    
+
     # Stores the engineering math data
     parsed: Optional[ParsedValues] = None
-    
+
+    # Revision comparison fields
+    status: Optional[str] = None  # 'added', 'modified', 'unchanged', 'removed'
+    old_value: Optional[str] = None  # Original value before modification
+
     class Config:
         from_attributes = True
 
