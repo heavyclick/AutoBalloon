@@ -48,7 +48,7 @@ router.post('/', async (req, res) => {
       throw new Error(`Vision API error: ${response.statusText}`);
     }
 
-    const data = await response.json();
+    const data = await response.json() as any;
     const textAnnotations = data.responses?.[0]?.textAnnotations;
 
     if (!textAnnotations || textAnnotations.length === 0) {

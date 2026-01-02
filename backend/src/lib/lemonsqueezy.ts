@@ -64,7 +64,7 @@ export async function createCheckout(params: {
     throw new Error(`LemonSqueezy checkout failed: ${error}`);
   }
 
-  const data = await response.json();
+  const data = await response.json() as any;
   return {
     checkoutUrl: data.data.attributes.url,
   };

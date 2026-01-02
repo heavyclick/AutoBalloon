@@ -85,7 +85,7 @@ router.post('/lemonsqueezy', async (req, res) => {
       await supabaseAdmin.from('users').update(updateData).eq('id', userId);
 
       // Send confirmation email for new subscriptions
-      if (action === 'subscription_created' && customerEmail) {
+      if (action === 'created' && customerEmail) {
         const planName = subscriptionData.plan_type === 'tier_20' ? 'Light' : 'Production';
         const amount = subscriptionData.plan_type === 'tier_20' ? '$20' : '$99';
 
