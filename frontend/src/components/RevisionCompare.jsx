@@ -13,9 +13,16 @@ export function RevisionCompare({ onCompareComplete, canDownload = false, onShow
   const [revB, setRevB] = useState(null);
   const [isComparing, setIsComparing] = useState(false);
   const [comparisonResult, setComparisonResult] = useState(null);
-  const [includeGhosts, setIncludeGhosts] = useState(true); // Default to true to show what was lost
+  const [includeGhosts, setIncludeGhosts] = useState(true);
+  const [alignmentMode, setAlignmentMode] = useState('auto'); // 'auto' or 'manual'
+  const [manualPoints, setManualPoints] = useState({ p1_a: null, p2_a: null, p1_b: null, p2_b: null });
+  const [currentManualStep, setCurrentManualStep] = useState(null); // 'p1_a', 'p2_a', 'p1_b', 'p2_b'
+  const [progress, setProgress] = useState({ step: '', percent: 0 });
+  const [currentPage, setCurrentPage] = useState(1);
   const fileInputARef = useRef(null);
   const fileInputBRef = useRef(null);
+  const imageARef = useRef(null);
+  const imageBRef = useRef(null);
 
   const handleFileSelect = (file, setRev) => {
     if (!file) return;
@@ -31,33 +38,103 @@ export function RevisionCompare({ onCompareComplete, canDownload = false, onShow
     reader.readAsDataURL(file);
   };
 
+  const handleImageClick = (e, rev, pointKey) => {
+    if (!currentManualStep) return;
+
+    const rect = e.target.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    // Convert to image coordinates
+    const scaleX = e.target.naturalWidth / e.target.offsetWidth;
+    const scaleY = e.target.naturalHeight / e.target.offsetHeight;
+
+    const imageX = x * scaleX;
+    const imageY = y * scaleY;
+
+    setManualPoints(prev => ({
+      ...prev,
+      [currentManualStep]: { x: imageX, y: imageY }
+    }));
+
+    // Progress to next step
+    const steps = ['p1_a', 'p2_a', 'p1_b', 'p2_b'];
+    const currentIndex = steps.indexOf(currentManualStep);
+    if (currentIndex < steps.length - 1) {
+      setCurrentManualStep(steps[currentIndex + 1]);
+    } else {
+      setCurrentManualStep(null);
+    }
+  };
+
+  const startManualAlignment = () => {
+    setAlignmentMode('manual');
+    setCurrentManualStep('p1_a');
+    setManualPoints({ p1_a: null, p2_a: null, p1_b: null, p2_b: null });
+  };
+
   const handleCompare = async () => {
     if (!revA || !revB) return;
-    
+
     setIsComparing(true);
-    
+    setProgress({ step: 'Uploading files...', percent: 10 });
+
     try {
       const formData = new FormData();
       formData.append('file_a', revA.file);
       formData.append('file_b', revB.file);
-      
-      // Call new Computer Vision endpoint
-      const response = await fetch(`${API_BASE_URL}/compare`, { 
-        method: 'POST', 
-        body: formData 
-      });
-      
+
+      let response;
+
+      if (alignmentMode === 'manual') {
+        // Manual alignment mode
+        setProgress({ step: 'Calculating transformation...', percent: 30 });
+
+        if (!manualPoints.p1_a || !manualPoints.p2_a || !manualPoints.p1_b || !manualPoints.p2_b) {
+          alert("Please select all 4 alignment points");
+          setIsComparing(false);
+          return;
+        }
+
+        formData.append('points', JSON.stringify(manualPoints));
+        response = await fetch(`${API_BASE_URL}/compare/manual`, {
+          method: 'POST',
+          body: formData
+        });
+      } else {
+        // Automatic alignment mode
+        setProgress({ step: 'Detecting features...', percent: 30 });
+        response = await fetch(`${API_BASE_URL}/compare`, {
+          method: 'POST',
+          body: formData
+        });
+      }
+
+      setProgress({ step: 'Comparing dimensions...', percent: 60 });
       const data = await response.json();
-      
+
       if (data.success) {
-        // Categorize dimensions based on the robust status returned by backend
-        // Backend returns: dimensions (active) and removed_dimensions (ghosts)
-        
-        const added = data.dimensions.filter(d => d.status === 'added');
-        const modified = data.dimensions.filter(d => d.status === 'modified');
-        const unchanged = data.dimensions.filter(d => d.status === 'unchanged');
-        const removed = data.removed_dimensions || [];
-        
+        setProgress({ step: 'Processing results...', percent: 90 });
+
+        // Handle multi-page or single-page results
+        const pages = data.pages || [
+          {
+            page_number: 1,
+            image: data.image,
+            dimensions: data.dimensions,
+            removed_dimensions: data.removed_dimensions,
+            stats: data.summary
+          }
+        ];
+
+        // Get current page data
+        const currentPageData = pages[currentPage - 1] || pages[0];
+
+        const added = currentPageData.dimensions.filter(d => d.status === 'added');
+        const modified = currentPageData.dimensions.filter(d => d.status === 'modified');
+        const unchanged = currentPageData.dimensions.filter(d => d.status === 'unchanged');
+        const removed = currentPageData.removed_dimensions || [];
+
         const changes = {
           added,
           modified,
@@ -67,18 +144,17 @@ export function RevisionCompare({ onCompareComplete, canDownload = false, onShow
 
         setComparisonResult({
           revB: {
-            image: data.image,
+            image: currentPageData.image,
             metadata: data.metadata,
-            dimensions: data.dimensions // Contains aligned IDs
+            dimensions: currentPageData.dimensions
           },
           changes,
-          summary: data.summary || {
-            added: added.length,
-            removed: removed.length,
-            modified: modified.length,
-            unchanged: unchanged.length
-          }
+          summary: data.summary || currentPageData.stats,
+          pages: pages,
+          totalPages: data.total_pages || pages.length
         });
+
+        setProgress({ step: 'Complete!', percent: 100 });
       } else {
         alert("Comparison failed: " + (data.detail || "Unknown error"));
       }
@@ -87,6 +163,36 @@ export function RevisionCompare({ onCompareComplete, canDownload = false, onShow
       alert("Network error during comparison");
     } finally {
       setIsComparing(false);
+      setProgress({ step: '', percent: 0 });
+    }
+  };
+
+  const handlePageChange = (newPage) => {
+    if (!comparisonResult || !comparisonResult.pages) return;
+
+    setCurrentPage(newPage);
+
+    const pageData = comparisonResult.pages[newPage - 1];
+    if (pageData) {
+      const added = pageData.dimensions.filter(d => d.status === 'added');
+      const modified = pageData.dimensions.filter(d => d.status === 'modified');
+      const unchanged = pageData.dimensions.filter(d => d.status === 'unchanged');
+      const removed = pageData.removed_dimensions || [];
+
+      setComparisonResult(prev => ({
+        ...prev,
+        revB: {
+          image: pageData.image,
+          metadata: prev.revB.metadata,
+          dimensions: pageData.dimensions
+        },
+        changes: {
+          added,
+          modified,
+          removed,
+          unchanged
+        }
+      }));
     }
   };
 
@@ -98,7 +204,7 @@ export function RevisionCompare({ onCompareComplete, canDownload = false, onShow
       }
       return;
     }
-    
+
     if (comparisonResult && onCompareComplete) {
       // Prepare the final list of balloons for the new revision
       let finalDimensions = [...comparisonResult.revB.dimensions];
@@ -115,7 +221,7 @@ export function RevisionCompare({ onCompareComplete, canDownload = false, onShow
         }));
         finalDimensions = [...finalDimensions, ...ghosts];
       }
-      
+
       onCompareComplete({
         dimensions: finalDimensions,
         image: comparisonResult.revB.image,
@@ -185,8 +291,21 @@ export function RevisionCompare({ onCompareComplete, canDownload = false, onShow
                     className="hidden"
                   />
                   {revA ? (
-                    <div>
-                      <img src={revA.preview} alt="Rev A" className="max-h-48 mx-auto rounded mb-2" />
+                    <div className="relative">
+                      <img
+                        ref={imageARef}
+                        src={revA.preview}
+                        alt="Rev A"
+                        className={`max-h-48 mx-auto rounded mb-2 ${alignmentMode === 'manual' && (currentManualStep === 'p1_a' || currentManualStep === 'p2_a') ? 'cursor-crosshair' : ''}`}
+                        onClick={(e) => handleImageClick(e, 'a')}
+                      />
+                      {/* Show alignment points */}
+                      {manualPoints.p1_a && imageARef.current && (
+                        <div className="absolute w-3 h-3 bg-green-500 rounded-full border-2 border-white" style={{ left: `${(manualPoints.p1_a.x / imageARef.current.naturalWidth) * 100}%`, top: `${(manualPoints.p1_a.y / imageARef.current.naturalHeight) * 100}%`, transform: 'translate(-50%, -50%)' }} title="Point 1" />
+                      )}
+                      {manualPoints.p2_a && imageARef.current && (
+                        <div className="absolute w-3 h-3 bg-blue-500 rounded-full border-2 border-white" style={{ left: `${(manualPoints.p2_a.x / imageARef.current.naturalWidth) * 100}%`, top: `${(manualPoints.p2_a.y / imageARef.current.naturalHeight) * 100}%`, transform: 'translate(-50%, -50%)' }} title="Point 2" />
+                      )}
                       <p className="text-green-400 text-sm">{revA.name}</p>
                     </div>
                   ) : (
@@ -220,8 +339,21 @@ export function RevisionCompare({ onCompareComplete, canDownload = false, onShow
                     className="hidden"
                   />
                   {revB ? (
-                    <div>
-                      <img src={revB.preview} alt="Rev B" className="max-h-48 mx-auto rounded mb-2" />
+                    <div className="relative">
+                      <img
+                        ref={imageBRef}
+                        src={revB.preview}
+                        alt="Rev B"
+                        className={`max-h-48 mx-auto rounded mb-2 ${alignmentMode === 'manual' && (currentManualStep === 'p1_b' || currentManualStep === 'p2_b') ? 'cursor-crosshair' : ''}`}
+                        onClick={(e) => handleImageClick(e, 'b')}
+                      />
+                      {/* Show alignment points */}
+                      {manualPoints.p1_b && imageBRef.current && (
+                        <div className="absolute w-3 h-3 bg-green-500 rounded-full border-2 border-white" style={{ left: `${(manualPoints.p1_b.x / imageBRef.current.naturalWidth) * 100}%`, top: `${(manualPoints.p1_b.y / imageBRef.current.naturalHeight) * 100}%`, transform: 'translate(-50%, -50%)' }} title="Point 1" />
+                      )}
+                      {manualPoints.p2_b && imageBRef.current && (
+                        <div className="absolute w-3 h-3 bg-blue-500 rounded-full border-2 border-white" style={{ left: `${(manualPoints.p2_b.x / imageBRef.current.naturalWidth) * 100}%`, top: `${(manualPoints.p2_b.y / imageBRef.current.naturalHeight) * 100}%`, transform: 'translate(-50%, -50%)' }} title="Point 2" />
+                      )}
                       <p className="text-[#E63946] text-sm">{revB.name}</p>
                     </div>
                   ) : (
@@ -351,41 +483,108 @@ export function RevisionCompare({ onCompareComplete, canDownload = false, onShow
         <div className="px-6 py-4 border-t border-[#2a2a2a] flex justify-between items-center">
           {!comparisonResult ? (
             <>
-              <div className="text-gray-500 text-sm">
-                {revA && revB ? 'Ready to compare' : 'Upload both revisions to compare'}
-              </div>
-              <button
-                onClick={handleCompare}
-                disabled={!revA || !revB || isComparing}
-                className="px-6 py-2 bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 text-white font-medium rounded-lg disabled:opacity-50 flex items-center gap-2"
-              >
-                {isComparing ? (
-                  <>
-                    <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                    </svg>
-                    Aligning & Comparing...
-                  </>
-                ) : (
-                  <>Compare Revisions</>
+              <div className="flex items-center gap-4">
+                <div className="text-gray-500 text-sm">
+                  {revA && revB ? 'Ready to compare' : 'Upload both revisions to compare'}
+                </div>
+                {revA && revB && (
+                  <button
+                    onClick={() => setAlignmentMode(alignmentMode === 'auto' ? 'manual' : 'auto')}
+                    className="px-4 py-1 bg-[#2a2a2a] hover:bg-[#3a3a3a] text-sm text-gray-300 rounded transition-colors"
+                  >
+                    {alignmentMode === 'auto' ? '🤖 Auto' : '👆 Manual'} Alignment
+                  </button>
                 )}
-              </button>
+                {alignmentMode === 'manual' && !currentManualStep && (
+                  <button
+                    onClick={startManualAlignment}
+                    className="px-4 py-1 bg-blue-600 hover:bg-blue-700 text-sm text-white rounded transition-colors"
+                  >
+                    Start Manual Alignment
+                  </button>
+                )}
+                {currentManualStep && (
+                  <div className="text-sm text-yellow-400">
+                    {currentManualStep === 'p1_a' && '→ Click lower-left corner on Rev A'}
+                    {currentManualStep === 'p2_a' && '→ Click upper-right corner on Rev A'}
+                    {currentManualStep === 'p1_b' && '→ Click lower-left corner on Rev B'}
+                    {currentManualStep === 'p2_b' && '→ Click upper-right corner on Rev B'}
+                  </div>
+                )}
+              </div>
+
+              <div className="flex flex-col items-end gap-2">
+                {isComparing && progress.step && (
+                  <div className="text-xs text-gray-400">
+                    {progress.step} ({progress.percent}%)
+                  </div>
+                )}
+                {isComparing && (
+                  <div className="w-48 h-1 bg-[#2a2a2a] rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-gradient-to-r from-purple-600 to-pink-600 transition-all duration-300"
+                      style={{ width: `${progress.percent}%` }}
+                    />
+                  </div>
+                )}
+                <button
+                  onClick={handleCompare}
+                  disabled={!revA || !revB || isComparing || (alignmentMode === 'manual' && (!manualPoints.p1_a || !manualPoints.p2_a || !manualPoints.p1_b || !manualPoints.p2_b))}
+                  className="px-6 py-2 bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 text-white font-medium rounded-lg disabled:opacity-50 flex items-center gap-2"
+                >
+                  {isComparing ? (
+                    <>
+                      <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                      </svg>
+                      {progress.step || 'Processing...'}
+                    </>
+                  ) : (
+                    <>Compare Revisions</>
+                  )}
+                </button>
+              </div>
             </>
           ) : (
             <>
-              <button
-                onClick={() => setComparisonResult(null)}
-                className="text-gray-400 hover:text-white"
-              >
-                ← Compare Different Files
-              </button>
-              
+              <div className="flex items-center gap-4">
+                <button
+                  onClick={() => setComparisonResult(null)}
+                  className="text-gray-400 hover:text-white"
+                >
+                  ← Compare Different Files
+                </button>
+
+                {/* Multi-page navigation */}
+                {comparisonResult.totalPages > 1 && (
+                  <div className="flex items-center gap-2 text-sm">
+                    <button
+                      onClick={() => handlePageChange(currentPage - 1)}
+                      disabled={currentPage === 1}
+                      className="px-2 py-1 bg-[#2a2a2a] hover:bg-[#3a3a3a] text-gray-300 rounded disabled:opacity-30 disabled:cursor-not-allowed"
+                    >
+                      ←
+                    </button>
+                    <span className="text-gray-400">
+                      Page {currentPage} of {comparisonResult.totalPages}
+                    </span>
+                    <button
+                      onClick={() => handlePageChange(currentPage + 1)}
+                      disabled={currentPage === comparisonResult.totalPages}
+                      className="px-2 py-1 bg-[#2a2a2a] hover:bg-[#3a3a3a] text-gray-300 rounded disabled:opacity-30 disabled:cursor-not-allowed"
+                    >
+                      →
+                    </button>
+                  </div>
+                )}
+              </div>
+
               <div className="flex items-center gap-4">
                  <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
-                    <input 
-                      type="checkbox" 
-                      checked={includeGhosts} 
+                    <input
+                      type="checkbox"
+                      checked={includeGhosts}
                       onChange={(e) => setIncludeGhosts(e.target.checked)}
                       className="rounded border-gray-600 bg-transparent text-purple-600 focus:ring-purple-600"
                     />

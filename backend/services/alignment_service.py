@@ -107,6 +107,67 @@ class AlignmentService:
             # Return a far-off point to indicate failure without crashing
             return -9999.0, -9999.0
 
+    def calculate_manual_alignment_matrix(
+        self,
+        p1_a: Tuple[float, float],
+        p2_a: Tuple[float, float],
+        p1_b: Tuple[float, float],
+        p2_b: Tuple[float, float]
+    ) -> np.ndarray:
+        """
+        Calculate similarity transformation from 2-point correspondence.
+        Used for manual alignment when user clicks alignment points.
+
+        Args:
+            p1_a: Lower-left point on image A (x, y)
+            p2_a: Upper-right point on image A (x, y)
+            p1_b: Lower-left point on image B (x, y)
+            p2_b: Upper-right point on image B (x, y)
+
+        Returns:
+            3x3 homography matrix for B -> A transformation
+        """
+        # Calculate vectors
+        vec_a = np.array([p2_a[0] - p1_a[0], p2_a[1] - p1_a[1]])
+        vec_b = np.array([p2_b[0] - p1_b[0], p2_b[1] - p1_b[1]])
+
+        # Calculate scale
+        len_a = np.linalg.norm(vec_a)
+        len_b = np.linalg.norm(vec_b)
+        scale = len_a / len_b if len_b > 0 else 1.0
+
+        # Calculate rotation angle
+        angle_a = np.arctan2(vec_a[1], vec_a[0])
+        angle_b = np.arctan2(vec_b[1], vec_b[0])
+        theta = angle_a - angle_b
+
+        # Build rotation + scale matrix
+        cos_t = np.cos(theta)
+        sin_t = np.sin(theta)
+
+        # First apply scale and rotation
+        R = np.array([
+            [scale * cos_t, -scale * sin_t, 0],
+            [scale * sin_t, scale * cos_t, 0],
+            [0, 0, 1]
+        ])
+
+        # Calculate translation needed to align p1_b to p1_a
+        p1_b_transformed = np.dot(R, [p1_b[0], p1_b[1], 1])
+        tx = p1_a[0] - p1_b_transformed[0]
+        ty = p1_a[1] - p1_b_transformed[1]
+
+        # Final transformation matrix
+        M = np.array([
+            [scale * cos_t, -scale * sin_t, tx],
+            [scale * sin_t, scale * cos_t, ty],
+            [0, 0, 1]
+        ])
+
+        logger.info(f"Manual alignment: scale={scale:.3f}, rotation={np.degrees(theta):.2f}°, translation=({tx:.1f}, {ty:.1f})")
+
+        return M
+
     def port_balloons(self, img_a_b64: str, img_b_b64: str, balloons_a: List) -> Tuple[List, Dict]:
         """
         Port balloons from Revision A (old) to Revision B (new).
@@ -246,6 +307,41 @@ class AlignmentService:
             stats["ported"] += 1
 
         return ported_balloons, stats
+
+    def align_and_compare_manual(
+        self,
+        dims_a: List,
+        dims_b: List,
+        p1_a: Tuple[float, float],
+        p2_a: Tuple[float, float],
+        p1_b: Tuple[float, float],
+        p2_b: Tuple[float, float]
+    ) -> Tuple[List, List, Dict]:
+        """
+        Compare revisions using manual 2-point alignment.
+        Fallback for blank drawings or when automatic alignment fails.
+
+        Args:
+            dims_a: Dimensions from revision A
+            dims_b: Dimensions from revision B
+            p1_a, p2_a: Alignment points on image A
+            p1_b, p2_b: Corresponding points on image B
+
+        Returns:
+            (processed_dims_b, removed_dims, stats)
+        """
+        stats = {"added": 0, "removed": 0, "modified": 0, "unchanged": 0, "method": "manual_2point"}
+
+        # Calculate transformation matrix
+        M = self.calculate_manual_alignment_matrix(p1_a, p2_a, p1_b, p2_b)
+
+        # Validate (manual alignment can still produce bad results if user clicked wrong)
+        if not self.validate_homography(M):
+            logger.warning("Manual alignment produced invalid transformation, using fallback")
+            return self._fallback_compare(dims_a, dims_b, error="Invalid manual alignment")
+
+        # Use the same matching logic as automatic alignment
+        return self._match_dimensions(dims_a, dims_b, M, stats)
 
     def align_and_compare(self, img_a_b64: str, img_b_b64: str, dims_a: List, dims_b: List) -> Tuple[List, List, Dict]:
         """
