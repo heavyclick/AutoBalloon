@@ -1011,7 +1011,7 @@ export function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall
       </div>
 
       {/* Table Manager (Bottom Panel) */}
-      <div className="h-96 border-t-2 border-[#2a2a2a] z-30 bg-[#0a0a0a]">
+      <div className="h-48 border-t-2 border-[#2a2a2a] z-30 bg-[#0a0a0a]">
         <TableManager
           dimensions={dimensions}
           bomItems={bomItems}
