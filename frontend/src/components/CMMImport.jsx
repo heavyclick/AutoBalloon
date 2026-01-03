@@ -119,7 +119,7 @@ export function CMMImport({ dimensions, onResultsImported }) {
 
     try {
       // NOTE: Ensure this endpoint exists in backend/api/routes.py
-      const response = await fetch(`${API_BASE_URL}/api/cmm/parse`, {
+      const response = await fetch(`${API_BASE_URL}/cmm/parse`, {
         method: 'POST',
         body: formData,
       });
