@@ -691,7 +691,7 @@ export function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall
   } : null;
 
   return (
-    <div className="h-screen flex flex-col bg-[#0a0a0a]">
+    <div className="min-h-screen flex flex-col bg-[#0a0a0a]">
       {/* CMM Import Modal */}
       {showCMMImport && (
         <CMMImport
