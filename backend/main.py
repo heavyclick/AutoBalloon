@@ -48,6 +48,8 @@ from api.download_routes import router as download_router
 from api.detect_region import detect_region, RegionDetectRequest
 # FIX: Import Guest Session Routes
 from api.guest_session_routes import router as guest_session_router
+# Template Routes for custom export templates
+from api.template_routes import router as template_router
 
 app.include_router(main_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
@@ -56,6 +58,8 @@ app.include_router(usage_router, prefix="/api")
 app.include_router(download_router)
 # FIX: Include Guest Session Router
 app.include_router(guest_session_router, prefix="/api")
+# Template Routes
+app.include_router(template_router, prefix="/api")
 
 
 # =============================================================================
@@ -368,7 +372,7 @@ async def api_root():
             "/api/debug",
             "/api/detect-region",
             "/download/pdf",
-            "/download/zip", 
+            "/download/zip",
             "/download/image",
             "/download/excel",
             "/api/auth/magic-link",
@@ -376,6 +380,11 @@ async def api_root():
             "/api/promo/redeem",
             "/api/access/check",
             "/api/usage/check",
+            "/api/templates/upload",
+            "/api/templates/list",
+            "/api/templates/{id}",
+            "/api/templates/{id}/download",
+            "/api/templates/tokens",
         ]
     }
 

@@ -16,7 +16,7 @@ import { PageNavigator } from './PageNavigator';
 import { DownloadMenu } from './DownloadMenu';
 import { downloadBlob } from '../utils/downloadHelpers';
 
-export function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, currentPage, setCurrentPage, totalPages }) {
+export function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall, currentPage, setCurrentPage, totalPages, visitorId, userEmail }) {
   const [isDownloading, setIsDownloading] = useState(false);
   const [selectedDimId, setSelectedDimId] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -571,7 +571,7 @@ export function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall
     }
   };
 
-  const handleDownloadExcel = async () => {
+  const handleDownloadExcel = async (templateName = null) => {
     if (!isPro) { onShowGlassWall(); return; }
     setIsDownloading(true);
     try {
@@ -597,7 +597,9 @@ export function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall
         specifications: specItems,
         part_number: result.metadata?.part_number || '',
         revision: result.metadata?.revision || '',
-        grid_detected: hasMultiplePages ? result.pages.every(p => p.grid_detected !== false) : (result.grid?.detected !== false)
+        grid_detected: hasMultiplePages ? result.pages.every(p => p.grid_detected !== false) : (result.grid?.detected !== false),
+        template_name: templateName,
+        visitor_id: visitorId
       };
 
       const response = await fetch(`${API_BASE_URL.replace('/api', '')}/download/excel`, {
@@ -610,7 +612,7 @@ export function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall
       });
       if (response.ok) {
         const blob = await response.blob();
-        const filename = response.headers.get('Content-Disposition')?.split('filename=')[1]?.replace(/"/g, '') || 'AS9102_Form3.xlsx';
+        const filename = response.headers.get('Content-Disposition')?.split('filename=')[1]?.replace(/"/g, '') || 'inspection.xlsx';
         downloadBlob(blob, filename);
       }
     } catch (err) {
@@ -912,6 +914,8 @@ export function BlueprintViewer({ result, onReset, token, isPro, onShowGlassWall
             totalPages={totalPages}
             totalDimensions={getTotalDimensions()}
             isPro={isPro}
+            visitorId={visitorId}
+            userEmail={userEmail}
           />
         </div>
       </div>

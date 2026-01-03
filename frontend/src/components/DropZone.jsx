@@ -177,6 +177,8 @@ export function DropZone({ onBeforeProcess, hasPromoAccess = false, userEmail = 
         currentPage={currentPage}
         setCurrentPage={setCurrentPage}
         totalPages={totalPages}
+        visitorId={visitorId}
+        userEmail={userEmail}
       />
     </>
   );

@@ -42,6 +42,7 @@ class ExportTemplate(str, Enum):
     SIMPLE = "SIMPLE"
     AS9102_FORM3 = "AS9102_FORM3"
     PPAP = "PPAP"
+    ISO13485 = "ISO13485"
     CUSTOM = "CUSTOM"
 
 

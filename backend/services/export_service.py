@@ -1,5 +1,5 @@
 """
-Export Service - AS9102 Rev C / ISO 13485 Compliant / Custom Templates
+Export Service - AS9102 Rev C / ISO 13485 Compliant / PPAP / Custom Templates
 Generates comprehensive inspection packages.
 
 Features:
@@ -7,10 +7,16 @@ Features:
 - Template Engine: Robust 'Mustache' style placeholder replacement ({{key}}) for custom reports.
 - Intelligent Table Expansion: Detects table rows in custom templates and auto-expands them.
 - Smart Math: Exports formulas for Max/Min limits.
+- PPAP Template: Production Part Approval Process with statistics (Cpk/Ppk).
+- ISO 13485 Template: Medical device traceability focused format.
 """
 import csv
 import io
+import os
+import json
 import copy
+import math
+import statistics
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Union, Tuple
 
@@ -22,6 +28,10 @@ from openpyxl.utils import get_column_letter
 from openpyxl.formatting.rule import CellIsRule
 
 from models import ExportFormat, ExportTemplate, ExportMetadata, BillOfMaterialItem, SpecificationItem
+
+# Template storage directory (relative to backend/)
+TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "templates")
+TEMPLATES_METADATA_FILE = os.path.join(TEMPLATES_DIR, "templates_metadata.json")
 
 class ExportService:
     """
@@ -53,6 +63,10 @@ class ExportService:
         top=Side(style='thin'), bottom=Side(style='thin')
     )
 
+    # Alignments
+    CENTER = Alignment(horizontal='center', vertical='center')
+    LEFT = Alignment(horizontal='left', vertical='center')
+
     # AS9102 Form 3 Column Definitions
     FORM3_HEADERS = [
         ("5. Char\nNo.", 8),            # A
@@ -76,27 +90,619 @@ class ExportService:
         filename: str = "inspection",
         grid_detected: bool = True,
         total_pages: int = 1,
-        custom_template_path: Optional[str] = None
+        custom_template_path: Optional[str] = None,
+        template_name: Optional[str] = None,
+        visitor_id: Optional[str] = None
     ) -> tuple[bytes, str, str]:
-        """Orchestrator for generating export files."""
-        
+        """
+        Orchestrator for generating export files.
+
+        Args:
+            template_name: Optional string to override template selection:
+                - "PPAP" -> PPAP template with statistics
+                - "ISO13485" -> ISO 13485 medical device template
+                - "AS9102" -> Standard AS9102 (default)
+                - custom template ID -> loads from templates/ directory
+        """
+
         if format == ExportFormat.CSV:
             return self._generate_csv(dimensions, filename, total_pages)
-        
-        # Excel Generation
+
+        # Check for named template override
+        if template_name:
+            template_name_upper = template_name.upper()
+
+            if template_name_upper == "PPAP":
+                return self._generate_ppap_xlsx(dimensions, metadata, filename)
+
+            elif template_name_upper == "ISO13485":
+                return self._generate_iso13485_xlsx(dimensions, metadata, filename)
+
+            elif template_name_upper in ["AS9102", "AS9102_FORM3", "AS9102_FULL"]:
+                return self._generate_full_package_xlsx(dimensions, metadata, bom, specifications, filename, grid_detected, total_pages)
+
+            else:
+                # Assume it's a custom template ID - try to load it
+                custom_path = self._get_custom_template_path(template_name, visitor_id)
+                if custom_path and os.path.exists(custom_path):
+                    return self._generate_from_template(custom_path, dimensions, bom, specifications, metadata, filename)
+
+        # Excel Generation (legacy enum-based routing)
         if template == ExportTemplate.SIMPLE:
             return self._generate_simple_xlsx(dimensions, filename, total_pages)
-        
+
         elif template == ExportTemplate.CUSTOM and custom_template_path:
             return self._generate_from_template(custom_template_path, dimensions, bom, specifications, metadata, filename)
-            
-        elif template in [ExportTemplate.AS9102_FORM3, "AS9102_FULL", ExportTemplate.PPAP]:
+
+        elif template == ExportTemplate.PPAP:
+            return self._generate_ppap_xlsx(dimensions, metadata, filename)
+
+        elif template in [ExportTemplate.AS9102_FORM3, "AS9102_FULL"]:
             # Default to Full Package (Standard AS9102)
             return self._generate_full_package_xlsx(dimensions, metadata, bom, specifications, filename, grid_detected, total_pages)
-        
+
         else:
             # Fallback
             return self._generate_full_package_xlsx(dimensions, metadata, bom, specifications, filename, grid_detected, total_pages)
+
+    def _get_custom_template_path(self, template_id: str, visitor_id: Optional[str] = None) -> Optional[str]:
+        """Get the file path for a custom template by ID."""
+        metadata = self._load_templates_metadata()
+
+        for tmpl in metadata.get("templates", []):
+            if tmpl.get("id") == template_id:
+                return tmpl.get("file_path")
+
+        # Also try direct filename match
+        if visitor_id:
+            potential_path = os.path.join(TEMPLATES_DIR, f"{visitor_id}_{template_id}.xlsx")
+            if os.path.exists(potential_path):
+                return potential_path
+
+        return None
+
+    # ==========================================
+    #  TEMPLATE MANAGEMENT (Upload, List, Delete)
+    # ==========================================
+
+    def _ensure_templates_dir(self):
+        """Ensure templates directory exists."""
+        if not os.path.exists(TEMPLATES_DIR):
+            os.makedirs(TEMPLATES_DIR)
+
+    def _load_templates_metadata(self) -> Dict:
+        """Load templates metadata from JSON file."""
+        self._ensure_templates_dir()
+        if os.path.exists(TEMPLATES_METADATA_FILE):
+            try:
+                with open(TEMPLATES_METADATA_FILE, 'r') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                pass
+        return {"templates": []}
+
+    def _save_templates_metadata(self, metadata: Dict):
+        """Save templates metadata to JSON file."""
+        self._ensure_templates_dir()
+        with open(TEMPLATES_METADATA_FILE, 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+    def upload_template(
+        self,
+        file_bytes: bytes,
+        template_name: str,
+        visitor_id: str,
+        user_email: Optional[str] = None
+    ) -> Dict:
+        """
+        Store an uploaded .xlsx template file.
+
+        Returns:
+            Dict with template info including id, name, created_at
+        """
+        self._ensure_templates_dir()
+
+        # Validate file is a valid xlsx
+        try:
+            wb = load_workbook(io.BytesIO(file_bytes))
+            wb.close()
+        except Exception as e:
+            raise ValueError(f"Invalid Excel file: {str(e)}")
+
+        # Generate unique template ID
+        import uuid
+        template_id = str(uuid.uuid4())[:8]
+
+        # Sanitize template name for filename
+        safe_name = "".join(c for c in template_name if c.isalnum() or c in "._- ").strip()
+        if not safe_name:
+            safe_name = "template"
+
+        # File path: {visitor_id}_{template_id}_{safe_name}.xlsx
+        filename = f"{visitor_id}_{template_id}_{safe_name}.xlsx"
+        file_path = os.path.join(TEMPLATES_DIR, filename)
+
+        # Save file
+        with open(file_path, 'wb') as f:
+            f.write(file_bytes)
+
+        # Update metadata
+        metadata = self._load_templates_metadata()
+        template_info = {
+            "id": template_id,
+            "name": template_name,
+            "filename": filename,
+            "file_path": file_path,
+            "visitor_id": visitor_id,
+            "user_email": user_email,
+            "created_at": datetime.now().isoformat(),
+            "file_size": len(file_bytes)
+        }
+        metadata["templates"].append(template_info)
+        self._save_templates_metadata(metadata)
+
+        return template_info
+
+    def list_templates(self, visitor_id: str, user_email: Optional[str] = None) -> List[Dict]:
+        """
+        List templates available for a user (by visitor_id or email).
+        """
+        metadata = self._load_templates_metadata()
+        user_templates = []
+
+        for tmpl in metadata.get("templates", []):
+            # Match by visitor_id or email
+            if tmpl.get("visitor_id") == visitor_id:
+                user_templates.append(tmpl)
+            elif user_email and tmpl.get("user_email") == user_email:
+                user_templates.append(tmpl)
+
+        return user_templates
+
+    def delete_template(self, template_id: str, visitor_id: str, user_email: Optional[str] = None) -> bool:
+        """
+        Delete a template by ID. Only the owner can delete.
+
+        Returns:
+            True if deleted, False if not found or not authorized
+        """
+        metadata = self._load_templates_metadata()
+        templates = metadata.get("templates", [])
+
+        for i, tmpl in enumerate(templates):
+            if tmpl.get("id") == template_id:
+                # Check ownership
+                is_owner = (
+                    tmpl.get("visitor_id") == visitor_id or
+                    (user_email and tmpl.get("user_email") == user_email)
+                )
+                if not is_owner:
+                    return False
+
+                # Delete file
+                file_path = tmpl.get("file_path")
+                if file_path and os.path.exists(file_path):
+                    os.remove(file_path)
+
+                # Remove from metadata
+                templates.pop(i)
+                metadata["templates"] = templates
+                self._save_templates_metadata(metadata)
+                return True
+
+        return False
+
+    def get_template_file(self, template_id: str, visitor_id: str, user_email: Optional[str] = None) -> Optional[tuple]:
+        """
+        Get template file bytes for download.
+
+        Returns:
+            Tuple of (bytes, filename) or None if not found/authorized
+        """
+        metadata = self._load_templates_metadata()
+
+        for tmpl in metadata.get("templates", []):
+            if tmpl.get("id") == template_id:
+                # Check ownership
+                is_owner = (
+                    tmpl.get("visitor_id") == visitor_id or
+                    (user_email and tmpl.get("user_email") == user_email)
+                )
+                if not is_owner:
+                    return None
+
+                file_path = tmpl.get("file_path")
+                if file_path and os.path.exists(file_path):
+                    with open(file_path, 'rb') as f:
+                        return (f.read(), tmpl.get("filename", "template.xlsx"))
+
+        return None
+
+    # ==========================================
+    #  PPAP TEMPLATE GENERATOR
+    # ==========================================
+
+    def _generate_ppap_xlsx(
+        self,
+        dimensions: List[Dict],
+        metadata: Optional[ExportMetadata],
+        filename: str
+    ) -> tuple[bytes, str, str]:
+        """
+        Generate PPAP (Production Part Approval Process) Excel template.
+
+        Features:
+        - Single sheet format
+        - Columns: Part Info, Characteristic, Specification, Results, Sample Size, Mean, Std Dev, Cpk, Ppk
+        - Basic statistics calculation
+        - Cpk/Ppk calculation when limits are provided
+        """
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "PPAP Dimensional Results"
+
+        # Header styling
+        header_fill = PatternFill(start_color="003366", end_color="003366", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF", size=10, name="Arial")
+        data_font = Font(color="000000", size=9, name="Arial")
+        thin_border = Border(
+            left=Side(style='thin'), right=Side(style='thin'),
+            top=Side(style='thin'), bottom=Side(style='thin')
+        )
+
+        # Title Row
+        ws.merge_cells('A1:L1')
+        title_cell = ws['A1']
+        title_cell.value = "PPAP DIMENSIONAL INSPECTION REPORT"
+        title_cell.font = Font(bold=True, size=14, name="Arial")
+        title_cell.alignment = Alignment(horizontal='center')
+
+        # Part Info Section
+        part_num = getattr(metadata, 'part_number', '') if metadata else ''
+        part_name = getattr(metadata, 'part_name', '') if metadata else ''
+        revision = getattr(metadata, 'revision', '') if metadata else ''
+
+        ws['A3'] = "Part Number:"
+        ws['B3'] = part_num
+        ws['C3'] = "Part Name:"
+        ws['D3'] = part_name
+        ws['E3'] = "Revision:"
+        ws['F3'] = revision
+        ws['G3'] = "Date:"
+        ws['H3'] = datetime.now().strftime("%Y-%m-%d")
+
+        for cell in ['A3', 'C3', 'E3', 'G3']:
+            ws[cell].font = Font(bold=True, size=9)
+
+        # Column Headers
+        headers = [
+            ("Char #", 8),
+            ("Characteristic", 20),
+            ("Specification", 25),
+            ("USL", 12),
+            ("LSL", 12),
+            ("Nominal", 12),
+            ("Sample 1", 12),
+            ("Sample 2", 12),
+            ("Sample 3", 12),
+            ("Mean", 12),
+            ("Std Dev", 12),
+            ("Cpk", 10),
+            ("Ppk", 10),
+            ("Status", 10)
+        ]
+
+        header_row = 5
+        for col_idx, (header, width) in enumerate(headers, 1):
+            cell = ws.cell(row=header_row, column=col_idx, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            cell.border = thin_border
+            ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+        # Data Rows
+        current_row = 6
+        for dim in dimensions:
+            parsed = dim.get("parsed") or {}
+
+            # Get limits
+            usl = parsed.get("max_limit")
+            lsl = parsed.get("min_limit")
+            nominal = parsed.get("nominal", 0)
+
+            # Sample results (actual value if available, otherwise empty)
+            actual = dim.get("actual", "")
+            samples = []
+            if actual:
+                try:
+                    samples = [float(actual)]
+                except (ValueError, TypeError):
+                    pass
+
+            # Calculate statistics
+            mean_val = ""
+            std_dev = ""
+            cpk = ""
+            ppk = ""
+            status = ""
+
+            if samples and len(samples) >= 1:
+                mean_val = statistics.mean(samples)
+                if len(samples) >= 2:
+                    std_dev = statistics.stdev(samples)
+                else:
+                    std_dev = 0
+
+                # Calculate Cpk if we have limits
+                if usl is not None and lsl is not None and std_dev and std_dev > 0:
+                    try:
+                        cpu = (float(usl) - mean_val) / (3 * std_dev)
+                        cpl = (mean_val - float(lsl)) / (3 * std_dev)
+                        cpk = min(cpu, cpl)
+                        ppk = cpk  # Ppk same as Cpk for small samples
+                    except (ZeroDivisionError, TypeError):
+                        pass
+
+                # Status based on Cpk or simple pass/fail
+                if isinstance(cpk, (int, float)):
+                    if cpk >= 1.33:
+                        status = "PASS"
+                    elif cpk >= 1.0:
+                        status = "MARGINAL"
+                    else:
+                        status = "FAIL"
+                elif usl is not None and lsl is not None:
+                    if float(lsl) <= mean_val <= float(usl):
+                        status = "PASS"
+                    else:
+                        status = "FAIL"
+
+            # Write row
+            ws.cell(row=current_row, column=1, value=dim.get("id", "")).border = thin_border
+            ws.cell(row=current_row, column=2, value=dim.get("zone", "")).border = thin_border
+            ws.cell(row=current_row, column=3, value=dim.get("value", "")).border = thin_border
+            ws.cell(row=current_row, column=4, value=usl if usl is not None else "").border = thin_border
+            ws.cell(row=current_row, column=5, value=lsl if lsl is not None else "").border = thin_border
+            ws.cell(row=current_row, column=6, value=nominal if nominal else "").border = thin_border
+            ws.cell(row=current_row, column=7, value=samples[0] if samples else "").border = thin_border
+            ws.cell(row=current_row, column=8, value=samples[1] if len(samples) > 1 else "").border = thin_border
+            ws.cell(row=current_row, column=9, value=samples[2] if len(samples) > 2 else "").border = thin_border
+
+            mean_cell = ws.cell(row=current_row, column=10, value=round(mean_val, 4) if isinstance(mean_val, float) else "")
+            mean_cell.border = thin_border
+
+            std_cell = ws.cell(row=current_row, column=11, value=round(std_dev, 6) if isinstance(std_dev, float) else "")
+            std_cell.border = thin_border
+
+            cpk_cell = ws.cell(row=current_row, column=12, value=round(cpk, 2) if isinstance(cpk, float) else "")
+            cpk_cell.border = thin_border
+
+            ppk_cell = ws.cell(row=current_row, column=13, value=round(ppk, 2) if isinstance(ppk, float) else "")
+            ppk_cell.border = thin_border
+
+            status_cell = ws.cell(row=current_row, column=14, value=status)
+            status_cell.border = thin_border
+            if status == "PASS":
+                status_cell.fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+            elif status == "FAIL":
+                status_cell.fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+            elif status == "MARGINAL":
+                status_cell.fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+
+            current_row += 1
+
+        # Footer
+        current_row += 2
+        ws.cell(row=current_row, column=1, value="Cpk Formula: min((USL - Mean)/(3*Sigma), (Mean - LSL)/(3*Sigma))").font = Font(italic=True, size=8, color="666666")
+        current_row += 1
+        ws.cell(row=current_row, column=1, value=f"Generated by AutoBalloon | {datetime.now().strftime('%Y-%m-%d')}").font = Font(italic=True, size=8, color="666666")
+
+        # Freeze header
+        ws.freeze_panes = 'A6'
+
+        # Build filename
+        full_filename = f"{part_num}_{filename}_PPAP.xlsx" if part_num else f"{filename}_PPAP.xlsx"
+
+        output = io.BytesIO()
+        wb.save(output)
+        return (output.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", full_filename)
+
+    # ==========================================
+    #  ISO 13485 TEMPLATE GENERATOR
+    # ==========================================
+
+    def _generate_iso13485_xlsx(
+        self,
+        dimensions: List[Dict],
+        metadata: Optional[ExportMetadata],
+        filename: str
+    ) -> tuple[bytes, str, str]:
+        """
+        Generate ISO 13485 (Medical Devices) Excel template.
+
+        Features:
+        - Focus on traceability
+        - Device ID, Measurement Tool Serial Number, Operator ID, Timestamp columns
+        - All standard dimension fields
+        - Compliance status column
+        """
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "ISO 13485 Inspection Record"
+
+        # Styling
+        header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+        subheader_fill = PatternFill(start_color="D9E2F3", end_color="D9E2F3", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF", size=10, name="Arial")
+        label_font = Font(bold=True, color="000000", size=9, name="Arial")
+        data_font = Font(color="000000", size=9, name="Arial")
+        thin_border = Border(
+            left=Side(style='thin'), right=Side(style='thin'),
+            top=Side(style='thin'), bottom=Side(style='thin')
+        )
+
+        # Title
+        ws.merge_cells('A1:O1')
+        title_cell = ws['A1']
+        title_cell.value = "ISO 13485:2016 DIMENSIONAL INSPECTION RECORD"
+        title_cell.font = Font(bold=True, size=14, name="Arial")
+        title_cell.alignment = Alignment(horizontal='center')
+
+        ws.merge_cells('A2:O2')
+        subtitle = ws['A2']
+        subtitle.value = "Medical Device Quality Management System - Documented Information"
+        subtitle.font = Font(italic=True, size=10, color="666666")
+        subtitle.alignment = Alignment(horizontal='center')
+
+        # Traceability Header Section
+        part_num = getattr(metadata, 'part_number', '') if metadata else ''
+        part_name = getattr(metadata, 'part_name', '') if metadata else ''
+        revision = getattr(metadata, 'revision', '') if metadata else ''
+        serial = getattr(metadata, 'serial_number', '') if metadata else ''
+
+        row = 4
+        traceability_fields = [
+            ("Device Part Number:", part_num, "Device Name:", part_name),
+            ("Revision/Version:", revision, "Serial Number/Lot:", serial),
+            ("Inspection Date:", datetime.now().strftime("%Y-%m-%d %H:%M"), "Document Reference:", ""),
+            ("Operator ID:", "", "Calibration Status:", "Verified"),
+        ]
+
+        for field_row in traceability_fields:
+            ws.cell(row=row, column=1, value=field_row[0]).font = label_font
+            ws.cell(row=row, column=2, value=field_row[1]).font = data_font
+            ws.cell(row=row, column=4, value=field_row[2]).font = label_font
+            ws.cell(row=row, column=5, value=field_row[3]).font = data_font
+            row += 1
+
+        # Column Headers
+        headers = [
+            ("Seq #", 6),
+            ("Char ID", 10),
+            ("Reference\nLocation", 12),
+            ("Characteristic", 30),
+            ("Classification", 12),
+            ("Specification\n(Min)", 12),
+            ("Specification\n(Max)", 12),
+            ("Nominal", 10),
+            ("Actual\nResult", 12),
+            ("Measurement\nTool", 15),
+            ("Tool Serial #", 12),
+            ("Operator\nInitials", 10),
+            ("Timestamp", 16),
+            ("Compliance", 10),
+            ("Notes/NCR #", 15)
+        ]
+
+        header_row = row + 1
+        for col_idx, (header, width) in enumerate(headers, 1):
+            cell = ws.cell(row=header_row, column=col_idx, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            cell.border = thin_border
+            ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+        # Data Rows
+        current_row = header_row + 1
+        for idx, dim in enumerate(dimensions, 1):
+            parsed = dim.get("parsed") or {}
+
+            min_limit = parsed.get("min_limit", "")
+            max_limit = parsed.get("max_limit", "")
+            nominal = parsed.get("nominal", "")
+            actual = dim.get("actual", "")
+            method = parsed.get("inspection_method", "")
+
+            # Determine compliance
+            compliance = ""
+            if actual and min_limit is not None and max_limit is not None:
+                try:
+                    actual_val = float(actual)
+                    if float(min_limit) <= actual_val <= float(max_limit):
+                        compliance = "PASS"
+                    else:
+                        compliance = "FAIL"
+                except (ValueError, TypeError):
+                    pass
+
+            # Write row
+            row_data = [
+                idx,
+                dim.get("id", ""),
+                dim.get("zone", ""),
+                dim.get("value", ""),
+                dim.get("classification", ""),
+                min_limit if min_limit is not None else "",
+                max_limit if max_limit is not None else "",
+                nominal if nominal else "",
+                actual,
+                method,
+                "",  # Tool Serial # (user fills)
+                "",  # Operator Initials (user fills)
+                "",  # Timestamp (user fills)
+                compliance,
+                ""   # Notes
+            ]
+
+            for col_idx, value in enumerate(row_data, 1):
+                cell = ws.cell(row=current_row, column=col_idx, value=value)
+                cell.font = data_font
+                cell.border = thin_border
+                cell.alignment = Alignment(horizontal='center' if col_idx != 4 else 'left')
+
+                # Color compliance
+                if col_idx == 14:
+                    if value == "PASS":
+                        cell.fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+                    elif value == "FAIL":
+                        cell.fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+
+            current_row += 1
+
+        # Add blank rows for manual entries
+        for _ in range(5):
+            for col_idx in range(1, 16):
+                ws.cell(row=current_row, column=col_idx).border = thin_border
+            current_row += 1
+
+        # Signature Section
+        current_row += 2
+        ws.merge_cells(f'A{current_row}:O{current_row}')
+        ws.cell(row=current_row, column=1, value="APPROVAL SECTION").font = Font(bold=True, size=11)
+
+        current_row += 1
+        sig_fields = [
+            ("Inspector Signature:", 1, 2),
+            ("Date:", 3, 4),
+            ("QA Review Signature:", 6, 7),
+            ("Date:", 8, 9),
+        ]
+        for label, col1, col2 in sig_fields:
+            ws.cell(row=current_row, column=col1, value=label).font = label_font
+            ws.cell(row=current_row, column=col2, value="____________________").font = data_font
+
+        # Footer
+        current_row += 3
+        ws.merge_cells(f'A{current_row}:O{current_row}')
+        footer = ws.cell(row=current_row, column=1)
+        footer.value = f"This document is controlled per ISO 13485:2016 requirements | Generated by AutoBalloon | {datetime.now().strftime('%Y-%m-%d')}"
+        footer.font = Font(italic=True, size=8, color="666666")
+
+        # Freeze header
+        ws.freeze_panes = f'A{header_row + 1}'
+
+        # Print settings
+        ws.page_setup.orientation = 'landscape'
+        ws.print_title_rows = f'1:{header_row}'
+
+        # Build filename
+        full_filename = f"{part_num}_{filename}_ISO13485.xlsx" if part_num else f"{filename}_ISO13485.xlsx"
+
+        output = io.BytesIO()
+        wb.save(output)
+        return (output.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", full_filename)
 
     def _generate_csv(self, dimensions: List[Dict], filename: str, total_pages: int = 1) -> tuple[bytes, str, str]:
         """Generate CSV export with classification support."""
